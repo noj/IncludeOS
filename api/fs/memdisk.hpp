@@ -20,19 +20,19 @@
 #define FS_MEMDISK_HPP
 
 #include <cstdint>
-#include <hw/drive.hpp>
+#include <hw/block_device.hpp>
 
 namespace fs {
 
-  class MemDisk : public hw::Drive {
+  class MemDisk : public hw::Block_device {
   public:
     static constexpr size_t SECTOR_SIZE = 512;
 
-    std::string blkname() const override {
-      return "memdisk" + std::to_string(blkid);
+    std::string device_name() const override {
+      return "memdisk" + std::to_string(id());
     }
 
-    virtual const char* name() const noexcept override
+    virtual const char* driver_name() const noexcept override
     { return "MemDisk"; }
 
     virtual block_t size() const noexcept override;
@@ -49,15 +49,23 @@ namespace fs {
       reader( read_sync(blk, cnt) );
     }
 
-    virtual buffer_t read_sync(block_t blk) override;
-    virtual buffer_t read_sync(block_t blk, size_t cnt) override;
+    buffer_t read_sync(block_t blk) override;
+    buffer_t read_sync(block_t blk, size_t cnt) override;
+
+    // not supported
+    void write(block_t, buffer_t, on_write_func callback) override {
+      callback(true);
+    }
+    bool write_sync(block_t, buffer_t) override { return true; };
 
     explicit MemDisk() noexcept;
 
+    void deactivate() override;
+
   private:
-    const char* const image_start_;
-    const char* const image_end_;
-    
+    const char* image_start_;
+    const char* image_end_;
+
     uint64_t& stat_read;
   }; //< class MemDisk
 

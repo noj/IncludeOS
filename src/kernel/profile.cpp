@@ -17,10 +17,10 @@
 
 #include <profile>
 #include <common>
-#include <hw/pit.hpp>
+#include <kernel/cpuid.hpp>
 #include <kernel/elf.hpp>
-#include <kernel/irq_manager.hpp>
-#include <util/fixedvec.hpp>
+#include <kernel/os.hpp>
+#include <util/fixed_vector.hpp>
 #include <unordered_map>
 #include <cassert>
 #include <algorithm>
@@ -30,20 +30,20 @@
 extern "C" {
   void parasite_interrupt_handler();
   void profiler_stack_sampler(void*);
-  void gather_stack_sampling();
+  static void gather_stack_sampling();
 }
 extern char _irq_cb_return_location;
 
 typedef uint32_t func_sample;
 struct Sampler
 {
-  fixedvector<uintptr_t, BUFFER_COUNT>* samplerq;
-  fixedvector<uintptr_t, BUFFER_COUNT>* transferq;
+  Fixed_vector<uintptr_t, BUFFER_COUNT>* samplerq;
+  Fixed_vector<uintptr_t, BUFFER_COUNT>* transferq;
   std::unordered_map<uintptr_t, func_sample> dict;
   uint64_t total  = 0;
   uint64_t asleep = 0;
-  int  lockless;
-  bool discard; // discard results as long as true
+  int  lockless = 0;
+  bool discard = false; // discard results as long as true
   StackSampler::mode_t mode = StackSampler::MODE_CURRENT;
 
   Sampler() {
@@ -51,48 +51,40 @@ struct Sampler
     #define blargh(T) std::remove_pointer<decltype(T)>::type;
     samplerq = new blargh(samplerq);
     transferq = new blargh(transferq);
-    total    = 0;
-    asleep   = 0;
-    lockless = 0;
-    discard  = false;
   }
 
   void begin() {
-    // gather samples repeatedly over small periods
-    using namespace std::chrono;
-    static const milliseconds GATHER_PERIOD_MS = 150ms;
-
-    hw::PIT::instance().on_repeated_timeout(
-        GATHER_PERIOD_MS, gather_stack_sampling);
+    // gather samples repeatedly over single period
+    __arch_preempt_forever(gather_stack_sampling);
+    // install interrupt handler (NOTE: after "initializing" PIT)
+    __arch_install_irq(0, parasite_interrupt_handler);
   }
-  void add(void* current, void* ra)
+  void add(void* current)
   {
     // need free space to take more samples
     if (samplerq->free_capacity()) {
       if (mode == StackSampler::MODE_CURRENT)
-          samplerq->add((uintptr_t) current);
-      else
-          samplerq->add((uintptr_t) ra);
+          samplerq->push_back((uintptr_t) current);
+      else if (mode == StackSampler::MODE_CALLER)
+          samplerq->push_back((uintptr_t) __builtin_return_address(2));
     }
     // return when its not our turn
     if (lockless) return;
 
-    // transfer all the built up samplings
+    // transfer all the built up samples
     transferq->copy(samplerq->begin(), samplerq->size());
     samplerq->clear();
     lockless = 1;
   }
 };
 
-Sampler& get() {
+static Sampler& get() {
   static Sampler sampler;
   return sampler;
 }
 
 void StackSampler::begin()
 {
-  // install interrupt handler
-  IRQ_manager::get().set_irq_handler(0, parasite_interrupt_handler);
   // start taking samples using PIT interrupts
   get().begin();
 }
@@ -101,18 +93,20 @@ void StackSampler::set_mode(mode_t md)
   get().mode = md;
 }
 
-void profiler_stack_sampler(void* esp)
+void profiler_stack_sampler(void* sample)
 {
-  void* current = esp; //__builtin_return_address(1);
-  // maybe qemu, maybe some bullshit we don't care about
-  if (UNLIKELY(current == nullptr || get().discard)) return;
-  // ignore event loop (and take sleep statistic)
-  if (current == &_irq_cb_return_location) {
-    ++get().asleep;
+  auto& system = get();
+  if (UNLIKELY(sample == nullptr)) return;
+  // gather sample statistics
+  system.total++;
+  if (sample == &_irq_cb_return_location) {
+    system.asleep++;
     return;
   }
+  // if discard enabled, ignore samples
+  if (UNLIKELY(system.discard)) return;
   // add address to sampler queue
-  get().add(current, __builtin_return_address(1));
+  system.add(sample);
 }
 
 void gather_stack_sampling()
@@ -137,18 +131,15 @@ void gather_stack_sampling()
             std::forward_as_tuple(1));
       }
     }
-    // increase total and switch back transferring of samples
-    get().total += get().transferq->size();
+    // switch back transferring of samples
     get().lockless = 0;
   }
 }
 
-uint64_t StackSampler::samples_total()
-{
+uint64_t StackSampler::samples_total() noexcept {
   return get().total;
 }
-uint64_t StackSampler::samples_asleep()
-{
+uint64_t StackSampler::samples_asleep() noexcept {
   return get().asleep;
 }
 
@@ -164,6 +155,7 @@ std::vector<Sample> StackSampler::results(int N)
   });
 
   std::vector<Sample> res;
+  char buffer[8192];
 
   N = (N > (int)vec.size()) ? vec.size() : N;
   if (N <= 0) return res;
@@ -171,12 +163,34 @@ std::vector<Sample> StackSampler::results(int N)
   for (auto& sa : vec)
   {
     // resolve the addr
-    auto func = Elf::resolve_symbol(sa.first);
-    res.push_back(Sample {sa.second, (void*) func.addr, func.name});
+    auto func = Elf::safe_resolve_symbol((void*) sa.first, buffer, sizeof(buffer));
+    if (func.name) {
+      res.push_back(Sample {sa.second, (void*) func.addr, func.name});
+    }
+    else {
+      int len = snprintf(buffer, sizeof(buffer), "0x%08x", func.addr);
+      res.push_back(Sample {sa.second, (void*) func.addr, std::string(buffer, len)});
+    }
 
     if (--N == 0) break;
   }
   return res;
+}
+
+void StackSampler::print(const int N)
+{
+  auto samp = results(N);
+  int total = samples_total();
+
+  printf("Stack sampling - %d results (%u samples)\n",
+         samp.size(), total);
+  for (auto& sa : samp)
+  {
+    // percentage of total samples
+    float perc = sa.samp / (float)total * 100.0f;
+    printf("%5.2f%%  %*u: %.*s\n",
+           perc, 8, sa.samp, sa.name.size(), sa.name.c_str());
+  }
 }
 
 void StackSampler::set_mask(bool mask)

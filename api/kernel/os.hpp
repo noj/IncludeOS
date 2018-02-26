@@ -18,14 +18,14 @@
 #ifndef KERNEL_OS_HPP
 #define KERNEL_OS_HPP
 
-#include <string>
-#include <sstream>
 #include <common>
+#include <arch.hpp>
 #include <kernel/memmap.hpp>
-#include <hw/cpu.hpp>
-#include <hertz>
-#include <vector>
 #include <kernel/rtc.hpp>
+#include <hertz>
+#include <string>
+#include <vector>
+#include <boot/multiboot.h>
 
 /**
  *  The entrypoint for OS services
@@ -35,46 +35,63 @@
 class OS {
 public:
   using print_func  = delegate<void(const char*, size_t)>;
-  using Custom_init = delegate<void()>;
+  using Plugin      = delegate<void()>;
+  using Span_mods   = gsl::span<multiboot_module_t>;
 
-  /* Get the version of the os */
-  static std::string version()
-  { return version_field; }
+  /**
+   * Returns the OS version string
+   **/
+  static const std::string& version() noexcept
+  { return version_str_; }
+
+  /**
+   * Returns the CPU architecture for which the OS was built
+   **/
+  static const std::string& arch() noexcept
+  { return arch_str_; }
+
+
+  /**
+   *  Returns the commandline arguments provided,
+   *  if any, to the VM passed on by multiboot or
+   *  other mechanisms. The first argument is always
+   *  the binary name.
+  **/
+  static const char* cmdline_args() noexcept;
 
   /** Clock cycles since boot. */
-  static uint64_t cycles_since_boot() {
-    return hw::CPU::rdtsc();
-  }
-  /** micro seconds since boot */
-  static int64_t micros_since_boot() {
-    return cycles_since_boot() / cpu_mhz_.count();
-  }
+  static uint64_t cycles_since_boot() noexcept;
+
+  /** Nanoseconds since boot converted from cycles */
+  static uint64_t nanos_since_boot() noexcept;
 
   /** Timestamp for when OS was booted */
-  static RTC::timestamp_t boot_timestamp()
-  { return booted_at_; }
+  static RTC::timestamp_t boot_timestamp() noexcept;
 
   /** Uptime in whole seconds. */
-  static RTC::timestamp_t uptime() {
-    return RTC::now() - booted_at_;
-  }
+  static RTC::timestamp_t uptime() noexcept;
 
-  static MHz cpu_freq() noexcept
-  { return cpu_mhz_; }
+  /** Time spent sleeping (halt) in cycles */
+  static uint64_t cycles_asleep() noexcept;
+
+  /** Time spent sleeping (halt) in nanoseconds */
+  static uint64_t nanos_asleep() noexcept;
+
+
+  static auto cpu_freq() noexcept
+  { return cpu_khz_; }
+
+  /**
+   * Reboot operating system
+   *
+   **/
+  static void reboot();
 
   /**
    * Shutdown operating system
    *
    **/
   static void shutdown();
-
-  /**
-   *  Write data to standard out callbacks
-   */
-  static size_t print(const char* ptr, const size_t len);
-
-  /** Start the OS.  @todo Should be `init()` - and not accessible from ABI */
-  static void start(uint32_t boot_magic, uint32_t boot_addr);
 
   /**
    *  Halt until next interrupt.
@@ -87,37 +104,96 @@ public:
   /**
    *  Returns true when the OS will still be running, and not shutting down.
    */
-  static bool is_running() {
+  static bool is_running() noexcept {
     return power_;
   }
+
+  /**
+   *  Returns true when the OS has passed the boot sequence, and
+   *  is at least processing plugins and about to call Service::start
+   */
+  static bool is_booted() noexcept {
+    return boot_sequence_passed_;
+  }
+
+  static bool block_drivers_ready() noexcept {
+    return m_block_drivers_ready;
+  }
+
+  /**
+   *  Returns true when the OS is currently panicking
+   */
+  static bool is_panicking() noexcept;
+
+  /**
+   * Sometimes the OS just has a bad day and crashes
+   * The on_panic handler will be called directly after a panic,
+   * or any condition which will deliberately cause the OS to become
+   * unresponsive. After the handler is called, the OS goes to sleep.
+   * This handler can thus be used to, for example, automatically
+   * have the OS restart on any crash.
+  **/
+  typedef void (*on_panic_func) (const char*);
+  static void on_panic(on_panic_func);
+
+  /**
+   *  Write data to standard out callbacks
+   */
+  static void print(const char* ptr, const size_t len);
 
   /**
    *  Add handler for standard output.
    */
   static void add_stdout(print_func func);
 
+  /**
+   *  The default output method preferred by each platform
+   *  Directly writes the string to its output mechanism
+   **/
+  static void default_stdout(const char*, size_t);
+
   /** Memory page helpers */
   static constexpr uint32_t page_size() noexcept {
     return 4096;
   }
-  static constexpr uint32_t page_nr_from_addr(uint32_t x) noexcept {
-    return x >> PAGE_SHIFT;
+  static constexpr uint32_t addr_to_page(uintptr_t addr) noexcept {
+    return addr >> PAGE_SHIFT;
   }
-  static constexpr uint32_t base_from_page_nr(uint32_t x) noexcept {
-    return x << PAGE_SHIFT;
+  static constexpr uintptr_t page_to_addr(uint32_t page) noexcept {
+    return page << PAGE_SHIFT;
   }
 
-  /** Currently used dynamic memory, in bytes */
+  /** Total used dynamic memory, in bytes */
   static uintptr_t heap_usage() noexcept;
 
+  /** Attempt to trim the heap end, reducing the size */
+  static void heap_trim() noexcept;
+
+  /** First address of the heap **/
+  static uintptr_t heap_begin() noexcept;
+
+  /** Last used address of the heap **/
+  static uintptr_t heap_end() noexcept;
+
+  /** Resize the heap if possible. Return (potentially) new size. **/
+  static uintptr_t resize_heap(size_t size);
+
   /** The maximum last address of the dynamic memory area (heap) */
-  static uintptr_t heap_max();
+  static uintptr_t heap_max() noexcept;
 
-  /** time spent sleeping (halt) in cycles */
-  static uint64_t get_cycles_halt() noexcept;
+  /** The end of usable memory **/
+  static uintptr_t memory_end() noexcept {
+    return memory_end_;
+  }
 
-  /** total time spent in cycles */
-  static uint64_t get_cycles_total() noexcept;
+  /**
+   *  Returns true when the current OS comes from a live update,
+   *  as opposed to booting from either a rollback or a normal boot
+   */
+  static bool is_live_updated() noexcept;
+
+  /** Returns the automatic location set aside for storing system and program state **/
+  static void* liveupdate_storage_area() noexcept;
 
   /**
    * A map of memory ranges. The key is the starting address in numeric form.
@@ -128,6 +204,9 @@ public:
     return memmap;
   }
 
+  /** Get "kernel modules", provided by multiboot */
+  static Span_mods modules();
+
   /**
    * Register a custom initialization function. The provided delegate is
    * guaranteed to be called after global constructors and device initialization
@@ -136,41 +215,55 @@ public:
    * @param delg : A delegate to be called
    * @param name : A human readable identifier
   **/
-  static void register_custom_init(Custom_init delg, const char* name);
+  static void register_plugin(Plugin delg, const char* name);
 
-private:
 
-  /** Process multiboot info. Called by 'start' if multibooted **/
-  static void multiboot(uint32_t boot_magic, uint32_t boot_addr);
+  /**
+   * Block for a while, e.g. until the next round in the event loop
+   **/
+  static void block();
 
-  static constexpr int PAGE_SHIFT = 12;
-
-  /** Indicate if the OS is running. */
-  static bool power_;
 
   /** The main event loop. Check interrupts, timers etc., and do callbacks. */
   static void event_loop();
 
-  static MHz cpu_mhz_;
+  /** Initialize platform, devices etc. */
+  static void start(uint32_t boot_magic, uint32_t boot_addr);
 
-  static RTC::timestamp_t booted_at_;
-  static std::string version_field;
+  static void start(char *cmdline, uintptr_t mem_size);
 
-  struct Custom_init_struct {
-    Custom_init_struct(Custom_init f, const char* n)
-      : func_{f}, name_{n}
-    {}
+  /** Initialize common subsystems, call Service::start */
+  static void post_start();
 
-    Custom_init func_;
-    const char* name_;
-  };
+  static void install_cpu_frequency(MHz);
 
-  static std::vector<Custom_init_struct> custom_init_;
+private:
+  /** Process multiboot info. Called by 'start' if multibooted **/
+  static void multiboot(uint32_t boot_addr);
 
-  static uintptr_t low_memory_size_;
-  static uintptr_t high_memory_size_;
+  static multiboot_info_t* bootinfo();
+
+  /** Boot with no multiboot params */
+  static void legacy_boot();
+
+  /** Resume stuff from a soft reset **/
+  static bool is_softreset_magic(uint32_t value);
+  static void resume_softreset(intptr_t boot_addr);
+
+  static constexpr int PAGE_SHIFT = 12;
+  static bool power_;
+  static bool boot_sequence_passed_;
+  static bool m_is_live_updated;
+  static bool m_block_drivers_ready;
+  static KHz cpu_khz_;
+
+  static uintptr_t liveupdate_loc_;
+  static std::string version_str_;
+  static std::string arch_str_;
+  static uintptr_t memory_end_;
   static uintptr_t heap_max_;
   static const uintptr_t elf_binary_size_;
+  static const char* cmdline;
 
   // Prohibit copy and move operations
   OS(OS&)  = delete;
@@ -181,6 +274,43 @@ private:
   // Prohibit construction
   OS() = delete;
 
+  friend void __platform_init();
 }; //< OS
+
+inline bool OS::is_live_updated() noexcept {
+  return OS::m_is_live_updated;
+}
+
+inline OS::Span_mods OS::modules()
+{
+  auto* bootinfo_ = bootinfo();
+  if (bootinfo_ and bootinfo_->flags & MULTIBOOT_INFO_MODS and bootinfo_->mods_count) {
+
+    Expects(bootinfo_->mods_count < std::numeric_limits<int>::max());
+
+    return Span_mods{
+      reinterpret_cast<multiboot_module_t*>(bootinfo_->mods_addr),
+        static_cast<int>(bootinfo_->mods_count) };
+  }
+  return nullptr;
+}
+
+inline uint64_t OS::cycles_since_boot() noexcept
+{
+  return __arch_cpu_cycles();
+}
+inline uint64_t OS::nanos_since_boot() noexcept
+{
+  return (cycles_since_boot() * 1e6) / cpu_freq().count();
+}
+
+inline RTC::timestamp_t OS::boot_timestamp() noexcept
+{
+  return RTC::boot_timestamp();
+}
+inline RTC::timestamp_t OS::uptime() noexcept
+{
+  return RTC::time_since_boot();
+}
 
 #endif //< KERNEL_OS_HPP

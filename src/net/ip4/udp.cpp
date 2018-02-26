@@ -15,93 +15,169 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#define DEBUG
-#include <os>
+//#define UDP_DEBUG 1
+#ifdef UDP_DEBUG
+#define PRINT(fmt, ...) printf(fmt, ##__VA_ARGS__)
+#else
+#define PRINT(fmt, ...) /* fmt */
+#endif
+
+#include <common>
 #include <net/ip4/udp.hpp>
 #include <net/util.hpp>
 #include <memory>
-
-#define likely(x)       __builtin_expect(!!(x), 1)
-#define unlikely(x)     __builtin_expect(!!(x), 0)
+#include <net/ip4/icmp4.hpp>
 
 namespace net {
 
   UDP::UDP(Stack& inet)
-    : stack_(inet)
+    : network_layer_out_{[] (net::Packet_ptr) {}},
+      stack_(inet),
+      ports_(inet.udp_ports())
   {
-    network_layer_out_ = [] (net::Packet_ptr) {};
     inet.on_transmit_queue_available({this, &UDP::process_sendq});
   }
 
-  void UDP::bottom(net::Packet_ptr pckt)
+  void UDP::receive(net::Packet_ptr pckt)
   {
-    auto udp = static_unique_ptr_cast<PacketUDP>(std::move(pckt));
+    auto udp_packet = static_unique_ptr_cast<PacketUDP>(std::move(pckt));
 
-    debug("\t Source port: %i, Dest. Port: %i Length: %i\n",
-          udp->src_port(), udp->dst_port(), udp->length());
+    PRINT("<%s> UDP", stack_.ifname().c_str());
 
-    auto it = ports_.find(udp->dst_port());
-    if (it != ports_.end())
-      {
-        debug("<UDP> Someone's listening to this port. Forwarding...\n");
-        it->second.internal_read(std::move(udp));
-        return;
-      }
+    PRINT("\t Source port: %u, Dest. Port: %u Length: %u\n",
+          udp_packet->src_port(), udp_packet->dst_port(), udp_packet->length());
 
-    debug("<UDP> Nobody's listening to this port. Drop!\n");
-  }
-
-  UDPSocket& UDP::bind(UDP::port_t port)
-  {
-    debug("<UDP> Binding to port %i\n", port);
-    /// ... !!!
-    auto it = ports_.find(port);
-    if (likely(it == ports_.end())) {
-      // create new socket
-      auto res = ports_.emplace(
-          std::piecewise_construct,
-          std::forward_as_tuple(port),
-          std::forward_as_tuple(*this, port));
-      it = res.first;
-    }else {
-      throw UDP::Port_in_use_exception(it->first);
+    auto it = find(udp_packet->destination());
+    if (it != sockets_.end()) {
+      PRINT("<%s> UDP found listener on %s\n",
+              stack_.ifname().c_str(), udp_packet->destination().to_string().c_str());
+      it->second.internal_read(*udp_packet);
+      return;
     }
-    return it->second;
+
+    // No destination found, check if broadcast
+    const auto dst_ip = udp_packet->ip_dst();
+    const bool is_bcast = (dst_ip == IP4::ADDR_BCAST or dst_ip == stack_.broadcast_addr());
+
+    if(is_bcast) {
+      auto dport = udp_packet->dst_port();
+      PRINT("<%s> UDP received broadcast on port %d\n", stack_.ifname().c_str(), dport);
+
+      for(auto it = sockets_.begin(); it != sockets_.end();)
+      {
+        auto current = it++; // internal_read() may result in close,
+                             // this is to avoid iterator invalidation
+        if(current->first.port() == dport)
+        {
+          PRINT("<%s> UDP found broadcast receiver: %s\n",
+              stack_.ifname().c_str(), current->first.to_string().c_str());
+          current->second.internal_read(*udp_packet);
+        }
+      }
+      return;
+    }
+
+    PRINT("<%s> UDP: nobody listening on %u. Drop!\n",
+            stack_.ifname().c_str(), udp_packet->dst_port());
+
+    // Sending ICMP error message of type Destination Unreachable and code PORT
+    // But only if the destination IP address is not broadcast or multicast
+    auto ip4_packet = static_unique_ptr_cast<PacketIP4>(std::move(udp_packet));
+    stack_.icmp().destination_unreachable(std::move(ip4_packet), icmp4::code::Dest_unreachable::PORT);
   }
 
-  UDPSocket& UDP::bind() {
-    if (ports_.size() >= 0xfc00)
-      panic("UPD Socket: All ports taken!");
+  void UDP::error_report(const Error& err, Socket dest) {
+    // If err is an ICMP error message:
+    // Report to application layer that got an ICMP error message of type and code (reason and subreason)
 
-    debug("UDP finding free ephemeral port\n");
-    while (ports_.find(++current_port_) != ports_.end())
-      // prevent automatic ports under 1024
-      if (current_port_  == 0) current_port_ = 1024;
+    // Find callback with this destination (address and port), and call it with the incoming err
+    // If the error f.ex. is an ICMP_error of type Destination Unreachable and code Fragmentation Needed,
+    // the err object contains the Path MTU so the user can get a hold of it in the application layer
+    // and choose to retransmit or not (the packet has been dropped by a node somewhere along the
+    // path to the receiver because the Don't Fragment bit was set on the packet and the packet was
+    // larger than the node's MTU value)
+    auto it = error_callbacks_.find(dest);
 
-    debug("UDP binding to %i port\n", current_port_);
-    return bind(current_port_);
+    if (it != error_callbacks_.end()) {
+      it->second.callback(err);
+      error_callbacks_.erase(it);
+    }
   }
 
-  bool UDP::is_bound(UDP::port_t port){
-    return ports_.find(port) != ports_.end();
+  UDPSocket& UDP::bind(const Socket socket)
+  {
+    const auto addr = socket.address();
+    const auto port = socket.port();
+
+    if(UNLIKELY( port == 0))
+      return bind(addr);
+
+    if(UNLIKELY( not stack_.is_valid_source(addr) ))
+      throw UDP_error{"Cannot bind to address: " + addr.to_string()};
+
+    auto& port_util = ports_[addr];
+
+    if(UNLIKELY( port_util.is_bound(port) ))
+      throw Port_in_use_exception{port};
+
+    debug("<%s> UDP bind to %s\n", stack_.ifname().c_str(), socket.to_string().c_str());
+
+    auto it = sockets_.emplace(
+      std::piecewise_construct,
+      std::forward_as_tuple(socket),
+      std::forward_as_tuple(*this, socket));
+
+    Ensures(it.second);
+
+    port_util.bind(port);
+
+    return it.first->second;
   }
 
-  void UDP::close(UDP::port_t port){
-    if (is_bound(port))
-      ports_.erase(port);
-    return;
+  UDPSocket& UDP::bind(const ip4::Addr addr)
+  {
+    if(UNLIKELY( not stack_.is_valid_source(addr) ))
+      throw UDP_error{"Cannot bind to address: " + addr.to_string()};
+
+    auto& port_util = ports_[addr];
+    const auto port = port_util.get_next_ephemeral();
+
+    Socket socket{addr, port};
+
+    auto it = sockets_.emplace(
+      std::piecewise_construct,
+      std::forward_as_tuple(socket),
+      std::forward_as_tuple(*this, socket));
+
+    Ensures(it.second);
+
+    // we know the port is not bound, else the above would throw
+    port_util.bind(port);
+
+    return it.first->second;
   }
 
-  void UDP::transmit(UDP::Packet_ptr udp) {
-    debug2("<UDP> Transmitting %i bytes (seg=%i) from %s to %s:%i\n",
-           udp->length(), udp->ip4_segment_size(),
-           udp->src().str().c_str(),
-           udp->dst().str().c_str(), udp->dst_port());
+  bool UDP::is_bound(const Socket socket) const
+  {
+    return sockets_.find(socket) != sockets_.end();
+  }
 
-    assert(udp->length() >= sizeof(udp_header));
-    assert(udp->protocol() == IP4::IP4_UDP);
+  void UDP::close(const Socket socket)
+  {
+    PRINT("Closed socket %s\n", socket.to_string().c_str());
+    sockets_.erase(socket);
+  }
 
-    //auto pckt = Packet::packet(udp);
+  void UDP::transmit(UDP::Packet_ptr udp)
+  {
+    PRINT("<UDP> Transmitting %u bytes (data=%u) from %s to %s:%i\n",
+           udp->length(), udp->data_length(),
+           udp->ip_src().str().c_str(),
+           udp->ip_dst().str().c_str(), udp->dst_port());
+
+    Expects(udp->length() >= sizeof(header));
+    Expects(udp->ip_protocol() == Protocol::UDP);
+
     network_layer_out_(std::move(udp));
   }
 
@@ -109,32 +185,52 @@ namespace net {
   {
     size_t packets = stack_.transmit_queue_available();
     if (packets) process_sendq(packets);
-    //else debug("<UDP> Transmit queue full. Waiting for offer");
+  }
 
+  void UDP::flush_expired() {
+    PRINT("<UDP> Flushing expired error callbacks\n");
+
+    for (auto& err : error_callbacks_) {
+      if (err.second.expired())
+        error_callbacks_.erase(err.first);
+    }
+
+    if (not error_callbacks_.empty())
+      flush_timer_.start(flush_interval_);
   }
 
   void UDP::process_sendq(size_t num)
   {
     while (!sendq.empty() && num != 0)
-      {
-        WriteBuffer& buffer = sendq.front();
+    {
+      WriteBuffer& buffer = sendq.front();
 
-        // create and transmit packet from writebuffer
-        buffer.write();
-        num--;
+      // create and transmit packet from writebuffer
+      buffer.write();
+      num--;
 
-        if (buffer.done()) {
-          auto copy = buffer.callback;
-          // remove buffer from queue
-          sendq.pop_front();
-          // call on_written callback
-          copy();
-          // reduce @num, just in case packets were sent in
-          // another stack frame
-          size_t avail = stack_.transmit_queue_available();
-          num = (num > avail) ? avail : num;
+      if (buffer.done()) {
+        if (buffer.send_callback != nullptr)
+          buffer.send_callback();
+
+        if (buffer.error_callback != nullptr) {
+          error_callbacks_.emplace(std::piecewise_construct,
+                              std::forward_as_tuple(Socket{buffer.d_addr, buffer.d_port}),
+                              std::forward_as_tuple(Error_entry{buffer.error_callback}));
+
+          if (UNLIKELY(not flush_timer_.is_running()))
+            flush_timer_.start(flush_interval_);
         }
+
+        // remove buffer from queue
+        sendq.pop_front();
+
+        // reduce @num, just in case packets were sent in
+        // another stack frame
+        size_t avail = stack_.transmit_queue_available();
+        num = (num > avail) ? avail : num;
       }
+    }
   }
 
   size_t UDP::WriteBuffer::packets_needed() const
@@ -146,12 +242,13 @@ namespace net {
     if (r % udp.max_datagram_size()) P++;
     return P;
   }
-  UDP::WriteBuffer::WriteBuffer(const uint8_t* data, size_t length, sendto_handler cb,
+
+  UDP::WriteBuffer::WriteBuffer(const uint8_t* data, size_t length, sendto_handler cb, error_handler ecb,
                                 UDP& stack, addr_t LA, port_t LP, addr_t DA, port_t DP)
-    : len(length), offset(0), callback(cb), udp(stack),
+    : len(length), offset(0), send_callback(cb), error_callback(ecb), udp(stack),
       l_addr(LA), l_port(LP), d_port(DP), d_addr(DA)
   {
-    // create a copy of the data,
+    // create a copy of the data,
     auto* copy = new uint8_t[len];
     memcpy(copy, data, length);
     // make it shared
@@ -161,32 +258,31 @@ namespace net {
 
   void UDP::WriteBuffer::write()
   {
+    UDP::Packet_ptr chain_head = nullptr;
 
-    // the bytes remaining to be written
-    UDP::Packet_ptr chain_head{};
+    PRINT("<%s> UDP: %i bytes to write, need %i packets \n",
+          udp.stack().ifname().c_str(),
+          remaining(),
+          remaining() / udp.max_datagram_size() + (remaining() % udp.max_datagram_size() ? 1 : 0));
 
-    debug("<UDP> %i bytes to write, need %i packets \n",
-           remaining(), remaining() / udp.max_datagram_size() + (remaining() % udp.max_datagram_size() ? 1 : 0));
-
-    do {
+    while (remaining()) {
+      // the max bytes we can write in one operation
       size_t total = remaining();
       total = (total > udp.max_datagram_size()) ? udp.max_datagram_size() : total;
 
-      // create some packet p (and convert it to PacketUDP)
-      auto p = udp.stack().create_packet(0);
-      // fill buffer (at payload position)
-      memcpy(p->buffer() + PacketUDP::HEADERS_SIZE,
-             buf.get() + this->offset, total);
+      // Create IP packet and convert it to PacketUDP)
+      auto p = udp.stack().create_ip_packet(Protocol::UDP);
+      if (!p) break;
 
-      // initialize packet with several infos
       auto p2 = static_unique_ptr_cast<PacketUDP>(std::move(p));
+      // Initialize UDP packet
+      p2->init(l_port, d_port);
+      p2->set_ip_src(l_addr);
+      p2->set_ip_dst(d_addr);
+      p2->set_data_length(total);
 
-      p2->init();
-      p2->header().sport = htons(l_port);
-      p2->header().dport = htons(d_port);
-      p2->set_src(l_addr);
-      p2->set_dst(d_addr);
-      p2->set_length(total);
+      // fill buffer (at payload position)
+      memcpy(p2->data(), buf.get() + this->offset, total);
 
       // Attach packet to chain
       if (!chain_head)
@@ -196,13 +292,11 @@ namespace net {
 
       // next position in buffer
       this->offset += total;
+    }
 
-    } while ( remaining() );
-
+    Expects(chain_head->ip_protocol() == Protocol::UDP);
     // ship the packet
     udp.transmit(std::move(chain_head));
-
-
   }
 
 } //< namespace net

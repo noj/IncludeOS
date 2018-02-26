@@ -36,7 +36,7 @@ public:
   /**
    * @brief Constructs a Timer without a handler
    */
-  Timer() : Timer({this, &Timer::_do_nothing}) {}
+  Timer() : Timer(nullptr) {}
 
   /**
    * @brief Constructs a Timer with a handler
@@ -45,8 +45,16 @@ public:
    */
   Timer(handler_t on_timeout)
     : id_{Timers::UNUSED_ID},
-      on_timeout_{on_timeout}
-  {}
+      on_timeout_{on_timeout}  {}
+
+  /** Move constructor, which stops the other timer and takes over **/
+  Timer(Timer&& other)
+    : id_{other.id_},
+      on_timeout_{std::move(other.on_timeout_)}
+  {
+    // the other timer is now "stopped"
+    other.id_ = Timers::UNUSED_ID;
+  }
 
   /**
    * @brief Start the timer with a timeout duration
@@ -56,8 +64,9 @@ public:
    * Requires on_timeout to be set.
    *
    * @param  duration until timing out
+   * @param  on_timeout (optional) on timeout handler
    */
-  inline void start(duration_t);
+  inline void start(duration_t, handler_t on_timeout = nullptr);
 
   /**
    * @brief Stops the timer
@@ -72,8 +81,9 @@ public:
    * and then starts the timer with a new refreshed duration.
    *
    * @param  duration until timing out
+   * @param  on_timeout (optional) on timeout handler
    */
-  inline void restart(duration_t);
+  inline void restart(duration_t, handler_t on_timeout = nullptr);
 
   /**
    * @brief Sets the on timeout handler
@@ -87,7 +97,7 @@ public:
   /**
    * @brief If the timer is running (active)
    *
-   * @return Wether the timer is running or not
+   * @return whether the timer is running or not
    */
   bool is_running() const
   { return id_ != Timers::UNUSED_ID; }
@@ -102,7 +112,6 @@ public:
 
   /** Delete copy and move */
   Timer(const Timer&)             = delete;
-  Timer(Timer&&)                  = delete;
   Timer& operator=(const Timer&)  = delete;
   Timer& operator=(Timer&&)       = delete;
 
@@ -122,13 +131,14 @@ private:
    */
   inline void _internal_timeout(id_t id);
 
-  void _do_nothing() {}
+}; // < class Timer
 
-} __attribute__((packed)); // < class Timer
-
-inline void Timer::start(duration_t when) {
+inline void Timer::start(duration_t when, handler_t on_timeout) {
   if(!is_running())
   {
+    if(on_timeout)
+      set_on_timeout(on_timeout);
+
     id_ = Timers::oneshot(when, {this, &Timer::_internal_timeout});
   }
 }
@@ -141,14 +151,15 @@ inline void Timer::stop() {
   }
 }
 
-inline void Timer::restart(duration_t when) {
+inline void Timer::restart(duration_t when, handler_t on_timeout) {
   stop();
-  start(when);
+  start(when, on_timeout);
 }
 
 inline void Timer::_internal_timeout(id_t) {
   id_ = Timers::UNUSED_ID;
-  on_timeout_();
+  if(on_timeout_)
+    on_timeout_();
 }
 
 #endif

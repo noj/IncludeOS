@@ -1,6 +1,6 @@
 // This file is a part of the IncludeOS unikernel - www.includeos.org
 //
-// Copyright 2015 Oslo and Akershus University College of Applied Sciences
+// Copyright 2015-2017 Oslo and Akershus University College of Applied Sciences
 // and Alfred Bratterud
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,21 +19,20 @@
 #ifndef NET_DHCP_DH4CLIENT_HPP
 #define NET_DHCP_DH4CLIENT_HPP
 
-#include <timers>
-#include "../packet.hpp"
-#include <net/ip4/ip4.hpp>
+#include "dhcp4.hpp"
+#include "options.hpp"
 
-namespace net
-{
-  class UDPSocket;
+#include <util/timer.hpp>
+#include <net/ip4/udp.hpp>
 
-  template <typename LINK, typename IPV>
-  class Inet;
+namespace net {
 
   class DHClient
   {
   public:
-    using Stack = Inet<LinkLayer, IP4>;
+    static const int NUM_RETRIES = 5;
+
+    using Stack = IP4::Stack;
     using config_func = delegate<void(bool)>;
 
     DHClient() = delete;
@@ -45,27 +44,30 @@ namespace net
 
     // Signal indicating the result of DHCP negotation
     // timeout is true if the negotiation timed out
-    void on_config(config_func handler)
-    {  config_handlers_.push_back(handler);  }
-
-    // disable or enable console spam
-    void set_silent(bool sil)
-    { this->console_spam = !sil; }
+    void on_config(config_func handler);
 
   private:
-    void offer(UDPSocket&, const char* data, size_t len);
-    void request(UDPSocket&);   // --> acknowledge
+    void send_first();
+    void offer(const char* data, size_t len);
+    void request(const dhcp::option::server_identifier* server_id);   // --> acknowledge
     void acknowledge(const char* data, size_t len);
 
+    void restart_negotation();
+    void end_negotiation(bool);
+
     Stack& stack;
-    uint32_t     xid;
+    uint32_t     xid = 0;
     IP4::addr    ipaddr, netmask, router, dns_server;
+    std::string  domain_name;
     uint32_t     lease_time;
     std::vector<config_func> config_handlers_;
-    Timers::id_t timeout;
-    bool  console_spam;
-    bool in_progress = false;
+    int          retries  = 0;
+    int          progress = 0;
+    Timer        timeout_timer_;
+    std::chrono::milliseconds timeout;
+    UDPSocket* socket = nullptr;
   };
+
 }
 
 #endif

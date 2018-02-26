@@ -19,6 +19,94 @@
 #include <cstring>
 #include <cstdint>
 #include <array>
+#include <unordered_map>
+
+namespace std
+{
+  template<>
+  struct hash<CPUID::Feature> {
+    size_t operator()(const CPUID::Feature& f) const {
+      return std::hash<int>()(static_cast<size_t>(f));
+    }
+  };
+}
+
+namespace CPUID {
+  const Feature_map feature_names {
+      {Feature::SSE2,"SSE2"},
+      {Feature::SSE3,"SSE3"},
+      {Feature::SSSE3,"SSSE3"},
+      {Feature::RDRAND,"RDRAND"},
+      {Feature::XSAVE,"XSAVE"},
+      {Feature::FXSR,"FXSR"},
+      {Feature::AES,"AES"},
+      {Feature::AVX,"AVX"},
+      {Feature::SSE4A,"SSE4a"},
+      {Feature::SSE4_1,"SSE4.1"},
+      {Feature::SSE4_2,"SSE4.2"},
+      {Feature::NX,"NX"},
+      {Feature::SYSCALL,"SYSCALL"},
+      {Feature::PDPE1GB,"PDPE1GB"},
+      {Feature::RDTSCP,"RDTSCP"},
+      {Feature::FMA, "FMA"},
+      {Feature::AVX2, "AVX2"},
+      {Feature::BMI1,"BMI1"},
+      {Feature::BMI2,"BMI2"},
+      {Feature::LZCNT,"LZCNT"},
+      {Feature::MOVBE,"MOVBE"},
+      {Feature::PCLMULQDQ,"PCLMULQDQ"},
+      {Feature::DTES64,"DTES64"},
+      {Feature::MONITOR,"MONITOR"},
+      {Feature::DS_CPL,"DS_CPL"},
+      {Feature::VMX,"VMX"},
+      {Feature::SMX,"SMX"},
+      {Feature::EST,"EST"},
+      {Feature::TM2,"TM2"},
+      {Feature::CNXT_ID,"CNXT_ID"},
+      {Feature::CX16,"CX16"},
+      {Feature::XTPR,"XTPR"},
+      {Feature::PDCM,"PDCM"},
+      {Feature::PCID,"PCID"},
+      {Feature::DCA,"DCA"},
+      {Feature::X2APIC,"X2APIC"},
+      {Feature::POPCNT,"POPCNT"},
+      {Feature::TSC_DEADLINE,"TSC_DEADLINE"},
+      {Feature::OSXSAVE,"OSXSAVE"},
+      {Feature::F16C,"F16C"},
+      {Feature::FPU,"FPU"},
+      {Feature::VME,"VME"},
+      {Feature::DE,"DE"},
+      {Feature::PSE,"PSE"},
+      {Feature::TSC,"TSC"},
+      {Feature::MSR,"MSR"},
+      {Feature::PAE,"PAE"},
+      {Feature::MCE,"MCE"},
+      {Feature::CX8,"CX8"},
+      {Feature::APIC,"APIC"},
+      {Feature::SEP,"SEP"},
+      {Feature::MTRR,"MTRR"},
+      {Feature::PGE,"PGE"},
+      {Feature::MCA,"MCA"},
+      {Feature::CMOV,"CMOV"},
+      {Feature::PAT,"PAT"},
+      {Feature::PSE_36,"PSE_36"},
+      {Feature::PSN,"PSN"},
+      {Feature::CLFLUSH,"CLFLUSH"},
+      {Feature::DS,"DS"},
+      {Feature::ACPI,"ACPI"},
+      {Feature::MMX,"MMX"},
+      {Feature::FXSR,"FXSR"},
+      {Feature::SSE,"SSE"},
+      {Feature::SS,"SS"},
+      {Feature::HTT,"HTT"},
+      {Feature::TM,"TM"},
+      {Feature::NX,"NX"},
+      {Feature::PDPE1GB,"PDPE1GB"},
+      {Feature::RDTSCP,"RDTSCP"},
+      {Feature::LM,"LM"},
+      {Feature::SVM,"SVM"}
+  };
+}
 
 namespace
 {
@@ -38,7 +126,7 @@ namespace
   };
 
   constexpr auto get_feature_info(Feature f)
-  {
+{
     // Use switch-case so that the we get compiler warnings if
     // we forget to add information for features that we have declared
     switch (f)
@@ -117,6 +205,12 @@ namespace
 
       case Feature::SVM:          return FeatureInfo { 0x80000001, 0, Register::ECX, 1u <<  2 }; // Secure Virtual Machine (AMD-V)
       case Feature::SSE4A:        return FeatureInfo { 0x80000001, 0, Register::ECX, 1u <<  6 }; // SSE4a
+      case Feature::AVX2:         return FeatureInfo { 7, 0, Register::ECX, 1u <<  5 }; // AVX2
+      case Feature::BMI1:         return FeatureInfo { 7, 0, Register::ECX, 1u <<  3 }; // BMI1
+      case Feature::BMI2:         return FeatureInfo { 7, 0, Register::ECX, 1u <<  8 }; // BMI2
+      case Feature::LZCNT:        return FeatureInfo { 7, 0, Register::ECX, 1u <<  5 }; // LZCNT
+
+
     }
   }
 
@@ -129,7 +223,7 @@ namespace
     uint32_t EDX;
   }; //< cpuid_t
 
-  cpuid_t cpuid(uint32_t func, uint32_t subfunc)
+  static cpuid_t cpuid(uint32_t func, uint32_t subfunc)
   {
     // Cache up to 4 results
     struct cpuid_cache_t
@@ -162,7 +256,7 @@ namespace
     cpuid_t result;
     asm volatile ("cpuid"
       : "=a"(result.EAX), "=b"(result.EBX), "=c"(result.ECX), "=d"(result.EDX)
-      : "a"(func), "c"(subfunc) : "%eax", "%ebx", "%ecx", "%edx");
+      : "a"(func), "c"(subfunc));
 
     // Try to find an empty spot in the cache
     for (auto& cached : cache)
@@ -182,22 +276,22 @@ namespace
 
 } //< namespace
 
-bool CPUID::is_amd_cpu()
+bool CPUID::is_amd_cpu() noexcept
 {
   auto result = cpuid(0, 0);
   return
-     memcmp(reinterpret_cast<char*>(&result.EBX), "htuA", 4) == 0
-  && memcmp(reinterpret_cast<char*>(&result.EDX), "itne", 4) == 0
-  && memcmp(reinterpret_cast<char*>(&result.ECX), "DMAc", 4) == 0;
+     memcmp((char*) &result.EBX, "Auth", 4) == 0
+  && memcmp((char*) &result.EDX, "enti", 4) == 0
+  && memcmp((char*) &result.ECX, "cAMD", 4) == 0;
 }
 
-bool CPUID::is_intel_cpu()
+bool CPUID::is_intel_cpu() noexcept
 {
   auto result = cpuid(0, 0);
   return
-     memcmp(reinterpret_cast<char*>(&result.EBX), "Genu", 4) == 0
-  && memcmp(reinterpret_cast<char*>(&result.EDX), "ineI", 4) == 0
-  && memcmp(reinterpret_cast<char*>(&result.ECX), "ntel", 4) == 0;
+     memcmp((char*) &result.EBX, "Genu", 4) == 0
+  && memcmp((char*) &result.EDX, "ineI", 4) == 0
+  && memcmp((char*) &result.ECX, "ntel", 4) == 0;
 }
 
 bool CPUID::has_feature(Feature f)
@@ -216,7 +310,7 @@ bool CPUID::has_feature(Feature f)
 
 #define KVM_CPUID_SIGNATURE       0x40000000
 
-unsigned CPUID::kvm_function()
+static unsigned kvm_function() noexcept
 {
   auto res = cpuid(KVM_CPUID_SIGNATURE, 0);
   /// "KVMKVMKVM"
@@ -224,10 +318,28 @@ unsigned CPUID::kvm_function()
       return res.EAX;
   return 0;
 }
-bool CPUID::kvm_feature(unsigned id)
+bool CPUID::kvm_feature(unsigned id) noexcept
 {
   unsigned func = kvm_function();
   if (func == 0) return false;
   auto res = cpuid(func, 0);
   return (res.EAX & (1 << id)) != 0;
+}
+
+CPUID::Feature_list CPUID::detect_features() {
+  CPUID::Feature_list vec;
+  for (const auto feat : feature_names) {
+    if (CPUID::has_feature(feat.first))
+      vec.push_back(feat.first);
+  }
+  return vec;
+}
+
+CPUID::Feature_names CPUID::detect_features_str() {
+  CPUID::Feature_names names;
+  auto features = detect_features();
+  for (auto& feat : features) {
+    names.push_back(feature_names.at(feat));
+  }
+  return names;
 }

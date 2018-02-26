@@ -1,6 +1,6 @@
 // This file is a part of the IncludeOS unikernel - www.includeos.org
 //
-// Copyright 2015 Oslo and Akershus University College of Applied Sciences
+// Copyright 2015-2017 Oslo and Akershus University College of Applied Sciences
 // and Alfred Bratterud
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,123 +15,171 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//#define DEBUG // Allow debugging
-//#define DEBUG2
+//#define ETH_DEBUG 1
+#ifdef ETH_DEBUG
+#define PRINT(fmt, ...) printf(fmt, ##__VA_ARGS__)
+#else
+#define PRINT(fmt, ...) /* fmt */
+#endif
 
-#include <os>
-
-#include <common>
-
-#include <net/ethernet/ethernet.hpp>
-#include <net/packet.hpp>
 #include <net/util.hpp>
+#include <net/ethernet/ethernet.hpp>
 #include <statman>
-#include <hw/nic.hpp>
+
+#ifdef ntohs
+#undef ntohs
+#endif
 
 namespace net {
 
-  // uint16_t(0x0000), uint32_t(0x01000000)
-  const Ethernet::addr Ethernet::MULTICAST_FRAME {0,0,0x01,0,0,0};
+  static void ignore(net::Packet_ptr) noexcept {
+    PRINT("<Ethernet upstream> Ignoring data (no real upstream)\n");
+  }
+  static void ignore_ip(net::Packet_ptr, const bool) noexcept {
+    debug("<Ethernet upstream_ip> Ignoring data (no real upstream)\n");
+  }
+  static int eth_name_idx = 0;
 
-  // uint16_t(0xFFFF), uint32_t(0xFFFFFFFF)
-  const Ethernet::addr Ethernet::BROADCAST_FRAME {0xff,0xff,0xff,0xff,0xff,0xff};
+  Ethernet::Ethernet(
+        downstream physical_downstream,
+        const addr& mac) noexcept
+  : mac_(mac),
+    ethernet_idx(eth_name_idx++),
+    packets_rx_{Statman::get().create(Stat::UINT64,
+                link_name() + ".ethernet.packets_rx").get_uint64()},
+    packets_tx_{Statman::get().create(Stat::UINT64,
+                link_name() + ".ethernet.packets_tx").get_uint64()},
+    packets_dropped_{Statman::get().create(Stat::UINT32,
+                link_name() + ".ethernet.packets_dropped").get_uint32()},
+    trailer_packets_dropped_{Statman::get().create(Stat::UINT32,
+                link_name() + ".ethernet.trailer_packets_dropped").get_uint32()},
+    ip4_upstream_{ignore_ip},
+    ip6_upstream_{ignore_ip},
+    arp_upstream_{ignore},
+    physical_downstream_(physical_downstream)
+  {}
 
-  // uint16_t(0x3333), uint32_t(0x01000000)
-  const Ethernet::addr Ethernet::IPv6mcast_01 {0x33,0x33,0x01,0,0,0};
+  void Ethernet::transmit(net::Packet_ptr pckt, addr dest, Ethertype type)
+  {
+    uint16_t t = net::ntohs(static_cast<uint16_t>(type));
+    // Trailer negotiation and encapsulation RFC 893 and 1122
+    if (UNLIKELY(t == net::ntohs(static_cast<uint16_t>(Ethertype::TRAILER_NEGO)) or
+      (t >= net::ntohs(static_cast<uint16_t>(Ethertype::TRAILER_FIRST)) and
+        t <= net::ntohs(static_cast<uint16_t>(Ethertype::TRAILER_LAST))))) {
+      PRINT("<Ethernet OUT> Ethernet type Trailer is not supported. Packet is not transmitted\n");
+      return;
+    }
 
-  // uint16_t(0x3333), uint32_t(0x02000000)
-  const Ethernet::addr Ethernet::IPv6mcast_02 {0x33,0x33,0x02,0,0,0};
+    // make sure packet is minimum ethernet frame size
+    //if (pckt->size() < 68) pckt->set_data_end(68);
 
-  static void ignore(Packet_ptr) noexcept {
-    debug("<Ethernet handler> Ignoring data (no real handler)\n");
+    PRINT("<Ethernet OUT> Transmitting %i b, from %s -> %s. Type: 0x%hx\n",
+          pckt->size(), mac_.str().c_str(), dest.str().c_str(), type);
+#ifndef ARP_PASSTHROUGH
+    Expects(dest.major or dest.minor);
+#endif
+
+    // Populate ethernet header for each packet in the (potential) chain
+    // NOTE: It's assumed that chained packets are for the same destination
+    auto* next = pckt.get();
+
+    do {
+      // Demote to ethernet frame
+      next->increment_layer_begin(- (int)sizeof(header));
+
+      auto& hdr = *reinterpret_cast<header*>(next->layer_begin());
+
+      // Add source address
+      hdr.set_src(mac_);
+      hdr.set_dest(dest);
+      hdr.set_type(type);
+      PRINT(" \t <Eth unchain> Transmitting %i b, from %s -> %s. Type: 0x%hx\n",
+            next->size(), mac_.str().c_str(), hdr.dest().str().c_str(), hdr.type());
+
+      // Stat increment packets transmitted
+      packets_tx_++;
+
+      next = next->tail();
+
+    } while (next);
+
+    physical_downstream_(std::move(pckt));
   }
 
-  Ethernet::Ethernet(hw::Nic& nic) noexcept
-  : nic_{nic},
-    packets_rx_{Statman::get().create(Stat::UINT64, nic.ifname() + ".ethernet.packets_rx").get_uint64()},
-    packets_tx_{Statman::get().create(Stat::UINT64, nic.ifname() + ".ethernet.packets_tx").get_uint64()},
-    packets_dropped_{Statman::get().create(Stat::UINT32, nic.ifname() + ".ethernet.packets_dropped").get_uint32()},
-    ip4_handler_{ignore},
-    ip6_handler_{ignore},
-    arp_handler_{ignore}
-{}
-
-  void Ethernet::transmit(Packet_ptr pckt) {
-    auto* hdr = reinterpret_cast<header*>(pckt->buffer());
-
-    // Verify ethernet header
-    Expects(hdr->dest.major != 0 || hdr->dest.minor !=0);
-    Expects(hdr->type != 0);
-
-    // Add source address
-    // @note Virtual call for MAC addr on every transmit - expensive?
-    hdr->src = mac();
-
-    debug2("<Ethernet OUT> Transmitting %i b, from %s -> %s. Type: %i\n",
-           pckt->size(), mac().str().c_str(), hdr->dest.str().c_str(), hdr->type);
-
-    // Stat increment packets transmitted
-    packets_tx_++;
-
-    physical_out_(std::move(pckt));
-  }
-
-  void Ethernet::bottom(Packet_ptr pckt) {
+#ifdef ARP_PASSTHROUGH
+  MAC::Addr linux_tap_device;
+#endif
+  void Ethernet::receive(Packet_ptr pckt) {
     Expects(pckt->size() > 0);
 
-    header* eth = reinterpret_cast<header*>(pckt->buffer());
+    header* eth = reinterpret_cast<header*>(pckt->layer_begin());
 
-    /** Do we pass on ethernet headers? As for now, yes.
-        data += sizeof(header);
-        len -= sizeof(header);
-    */
-    debug2("<Ethernet IN> %s => %s , Eth.type: 0x%x ",
-           eth->src.str().c_str(), eth->dest.str().c_str(), eth->type);
+    PRINT("<Ethernet IN> %s => %s , Eth.type: 0x%hx ",
+          eth->src().str().c_str(), eth->dest().str().c_str(), eth->type());
+
+#ifdef ARP_PASSTHROUGH
+    linux_tap_device = eth->src();
+#endif
 
     // Stat increment packets received
     packets_rx_++;
 
-    bool dropped = false;
-
-    switch(eth->type) {
-    case ETH_IP4:
-      debug2("IPv4 packet\n");
-      ip4_handler_(std::move(pckt));
+    switch(eth->type()) {
+    case Ethertype::IP4:
+      PRINT("IPv4 packet\n");
+      pckt->increment_layer_begin(sizeof(header));
+      ip4_upstream_(std::move(pckt), eth->dest() == MAC::BROADCAST);
       break;
 
-    case ETH_IP6:
-      debug2("IPv6 packet\n");
-      ip6_handler_(std::move(pckt));
+    case Ethertype::IP6:
+      PRINT("IPv6 packet\n");
+      pckt->increment_layer_begin(sizeof(header));
+      ip6_upstream_(std::move(pckt), eth->dest() == MAC::BROADCAST);
       break;
 
-    case ETH_ARP:
-      debug2("ARP packet\n");
-      arp_handler_(std::move(pckt));
+    case Ethertype::ARP:
+      PRINT("ARP packet\n");
+      pckt->increment_layer_begin(sizeof(header));
+      arp_upstream_(std::move(pckt));
       break;
 
-    case ETH_WOL:
-      dropped = true;
-      debug2("Wake-on-LAN packet\n");
+    case Ethertype::WOL:
+      packets_dropped_++;
+      PRINT("Wake-on-LAN packet\n");
       break;
 
-    case ETH_VLAN:
-      dropped = true;
-      debug("VLAN tagged frame (not yet supported)");
+    case Ethertype::VLAN:
+      PRINT("VLAN frame\n");
+      if(not vlan_upstream_)
+        packets_dropped_++;
+      else {
+        vlan_upstream_(std::move(pckt));
+      }
       break;
 
     default:
-      dropped = true;
-      // This might be 802.3 LLC traffic
-      if (net::ntohs(eth->type) > 1500) {
-        debug("<Ethernet> UNKNOWN ethertype 0x%x\n", ntohs(eth->type));
-      }else {
-        debug2("IEEE802.3 Length field: 0x%x\n", ntohs(eth->type));
+      uint16_t type = net::ntohs(static_cast<uint16_t>(eth->type()));
+      packets_dropped_++;
+
+      // Trailer negotiation and encapsulation RFC 893 and 1122
+      if (UNLIKELY(type == net::ntohs(static_cast<uint16_t>(Ethertype::TRAILER_NEGO)) or
+        (type >= net::ntohs(static_cast<uint16_t>(Ethertype::TRAILER_FIRST)) and
+          type <= net::ntohs(static_cast<uint16_t>(Ethertype::TRAILER_LAST))))) {
+        trailer_packets_dropped_++;
+        PRINT("Trailer packet\n");
+        break;
       }
+
+      // This might be 802.3 LLC traffic
+      if (type > 1500) {
+        PRINT("<Ethernet> UNKNOWN ethertype 0x%hx\n", eth->type());
+      } else {
+        PRINT("IEEE802.3 Length field: 0x%hx\n", eth->type());
+      }
+
       break;
     }
 
-    if(dropped)
-      packets_dropped_++;
   }
 
 } // namespace net

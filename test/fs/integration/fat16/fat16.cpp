@@ -27,53 +27,57 @@
 void Service::start(const std::string&)
 {
   INFO("FAT16", "Running tests for FAT16");
-  auto disk = fs::new_shared_memdisk();
+  auto disk = fs::shared_memdisk();
   assert(disk);
 
   // verify that the size is indeed N sectors
-  CHECKSERT(disk->dev().size() == 16500, "Disk size 16500 sectors");
+  CHECKSERT(disk->dev().size() == 6, "Disk size 6 sectors");
 
   // which means that the disk can't be empty
   CHECKSERT(!disk->empty(), "Disk not empty");
 
-  // auto-mount filesystem
-  disk->mount(
-  [disk] (fs::error_t err)
+  // auto-init filesystem
+  disk->init_fs(
+  [] (fs::error_t err, auto& fs)
   {
-    CHECKSERT(!err, "Filesystem auto-mounted");
+    if (err) {
+      printf("Init error: %s\n", err.to_string().c_str());
+    }
+    CHECKSERT(!err, "Filesystem auto-initialized");
 
-    auto& fs = disk->fs();
     printf("\t\t%s filesystem\n", fs.name().c_str());
 
     auto list = fs.ls("/");
     CHECKSERT(!list.error, "List root directory");
 
-    CHECKSERT(list.entries->size() == 1, "Exactly one ent in root dir");
+    CHECKSERT(list.entries->size() == 3, "Exactly 3 entries in root dir");
 
-    auto& e = list.entries->at(0);
+    auto& e = list.entries->at(2);
     CHECKSERT(e.is_file(), "Ent is a file");
     CHECKSERT(e.name() == "banana.txt", "Ents name is 'banana.txt'");
-
   });
-  // re-mount on MBR (sigh)
-  disk->mount(disk->MBR,
-  [disk] (fs::error_t err)
+  // re-init on MBR (sigh)
+  disk->init_fs(disk->MBR,
+  [] (fs::error_t err, auto& fs)
   {
-    CHECKSERT(!err, "Filesystem mounted on VBR1");
+    CHECKSERT(!err, "Filesystem initialized on VBR1");
 
     // verify that we can read file
-    auto& fs = disk->fs();
     auto ent = fs.stat("/banana.txt");
     CHECKSERT(ent.is_valid(), "Stat file in root dir");
     CHECKSERT(ent.is_file(), "Entity is file");
     CHECKSERT(!ent.is_dir(), "Entity is not directory");
     CHECKSERT(ent.name() == "banana.txt", "Name is 'banana.txt'");
 
-    printf("%s\n", internal_banana.c_str());
+    printf("Original banana (%ld bytes):\n%s\n",
+            internal_banana.size(), internal_banana.c_str());
 
     // try reading banana-file
     auto buf = fs.read(ent, 0, ent.size());
+    CHECKSERT(!buf.error(), "No error reading file");
+
     auto banana = buf.to_string();
+    printf("New banana (%ld bytes):\n%s\n", banana.size(), banana.c_str());
 
     CHECKSERT(banana == internal_banana, "Correct banana #1");
 

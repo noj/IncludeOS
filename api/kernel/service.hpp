@@ -6,9 +6,9 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
-// 
+//
 //     http://www.apache.org/licenses/LICENSE-2.0
-// 
+//
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -28,30 +28,31 @@
 class Service {
 public:
   /**
-   *  Get the name of the service
-   *
-   *  @return: The name of the service
+   *  @return: The (descriptive) name of the service
    */
-  static std::string name();
-  
+  static const char* name();
+
+  /**
+   *  @return: The name of the service binary
+   */
+  static const char* binary_name();
+
+
   /**
    *  The service entry point
    *
    *  This is like an applications 'main' function
-   *  
+   *
    *  @note Whenever this function returns, the OS will be sleeping
    *        until an external interrupt fires (there are no regular timer
    *        interrupts unless you've enabled them).
    */
-  static void start(const std::string&);
+  static void start();
+  static void start(const std::string& cmdline_args);
+
 
   /**
-   * Returns the command-line provided to multiboot
-  **/
-  static const std::string& command_line();
-
-  /**
-   * Ready is called when the kernel is done calibrating stuff and won't be 
+   * Ready is called when the kernel is done calibrating stuff and won't be
    * doing anything on its own anymore
   **/
   static void ready();
@@ -64,6 +65,7 @@ public:
    *  ensure a safe shutdown.
    */
   static void stop();
+
 }; //< Service
 
 #endif //< KERNEL_SERVICE_HPP

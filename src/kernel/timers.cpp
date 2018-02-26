@@ -1,38 +1,52 @@
 #include <kernel/timers.hpp>
 
+#include <kernel/os.hpp>
+#include <kernel/events.hpp>
+#include <kernel/rtc.hpp>
+#include <service>
+#include <smp>
+#include <statman>
 #include <map>
 #include <vector>
-#include <kernel/os.hpp>
-#include <statman>
 
 using namespace std::chrono;
-typedef Timers::id_t       id_t;
 typedef Timers::duration_t duration_t;
 typedef Timers::handler_t  handler_t;
 
-static void sched_timer(duration_t when, id_t id);
+/// time functions ///
 
-struct Timer
+static inline auto now() noexcept
 {
-  Timer(duration_t p, handler_t cb)
-    : period(p), callback(cb), deferred_destruct(false) {}
+  return nanoseconds(RTC::nanos_now());
+}
+
+/// internal timer ///
+
+struct SystemTimer
+{
+  SystemTimer(duration_t t, duration_t p, handler_t cb)
+    : time(t), period(p), callback(std::move(cb)) {}
+
+  SystemTimer(SystemTimer&& other)
+    : time(other.time), period(other.period),
+      callback(std::move(other.callback)),
+      already_dead(other.already_dead) {}
 
   bool is_alive() const noexcept {
-    return deferred_destruct == false;
+    return already_dead == false;
   }
-
   bool is_oneshot() const noexcept {
     return period.count() == 0;
   }
-
   void reset() {
     callback.reset();
-    deferred_destruct = false;
+    already_dead = false;
   }
 
+  duration_t time;
   duration_t period;
   handler_t  callback;
-  bool deferred_destruct = false;
+  bool already_dead = false;
 };
 
 /**
@@ -46,208 +60,219 @@ struct Timer
  * 6. Free timer IDs are retrieved from a stack of free timer IDs (or through
  *     expanding the "fixed" vector)
 **/
-
 static bool signal_ready = false;
-static bool is_running   = false;
-static uint32_t dead_timers = 0;
-static Timers::start_func_t arch_start_func;
-static Timers::stop_func_t  arch_stop_func;
-static std::vector<Timer>   timers;
-static std::vector<id_t>    free_timers;
-// timers sorted by timestamp
-static std::multimap<duration_t, id_t> scheduled;
-/** Stats */
-static uint64_t& oneshot_started_{Statman::get().create(Stat::UINT64, "timers.oneshot_started").get_uint64()};
-static uint64_t& oneshot_stopped_{Statman::get().create(Stat::UINT64, "timers.oneshot_stopped").get_uint64()};
-static uint32_t& periodic_started_{Statman::get().create(Stat::UINT32, "timers.periodic_started").get_uint32()};
-static uint32_t& periodic_stopped_{Statman::get().create(Stat::UINT32, "timers.periodic_stopped").get_uint32()};
+
+struct alignas(SMP_ALIGN) timer_system
+{
+  void free_timer(Timers::id_t);
+  void sched_timer(duration_t when, Timers::id_t);
+
+  bool     is_running  = false;
+  int      interrupt = 0;
+  Timers::start_func_t arch_start_func;
+  Timers::stop_func_t  arch_stop_func;
+  std::vector<SystemTimer>  timers;
+  std::vector<Timers::id_t> free_timers;
+  // timers sorted by timestamp
+  std::multimap<duration_t, Timers::id_t> scheduled;
+  /** Stats */
+  int64_t*  oneshot_started = nullptr;
+  int64_t*  oneshot_stopped = nullptr;
+  uint32_t* periodic_started = nullptr;
+  uint32_t* periodic_stopped = nullptr;
+};
+static SMP_ARRAY<timer_system> systems;
+
+void timer_system::free_timer(Timers::id_t id)
+{
+  this->timers[id].reset();
+  this->free_timers.push_back(id);
+}
+
+static inline timer_system& get() {
+  return PER_CPU(systems);
+}
 
 void Timers::init(const start_func_t& start, const stop_func_t& stop)
 {
+  auto& system = get();
+  // event for processing timers
+  system.interrupt = Events::get().subscribe(&Timers::timers_handler);
   // architecture specific start and stop functions
-  arch_start_func = start;
-  arch_stop_func  = stop;
+  system.arch_start_func = start;
+  system.arch_stop_func  = stop;
+
+  const std::string CPU = "cpu" + std::to_string(SMP::cpu_id());
+  system.oneshot_started = (int64_t*) &Statman::get().create(Stat::UINT64, CPU + ".timers.oneshot_started").get_uint64();
+  system.oneshot_stopped = (int64_t*) &Statman::get().create(Stat::UINT64, CPU + ".timers.oneshot_stopped").get_uint64();
+  system.periodic_started = &Statman::get().create(Stat::UINT32, CPU + ".timers.periodic_started").get_uint32();
+  system.periodic_stopped = &Statman::get().create(Stat::UINT32, CPU + ".timers.periodic_stopped").get_uint32();
+
 }
 
+bool Timers::is_ready()
+{
+  return signal_ready;
+}
 void Timers::ready()
 {
-  assert(signal_ready == false);
   signal_ready = true;
   // begin processing timers if any are queued
-  if (is_running == false) {
+  if (get().is_running == false) {
     timers_handler();
   }
+  // call Service::ready(), because timer system is ready!
+  Service::ready();
 }
 
-id_t Timers::periodic(duration_t when, duration_t period, const handler_t& handler)
+Timers::id_t Timers::periodic(duration_t when, duration_t period, handler_t handler)
 {
-  id_t id;
+  assert(handler != nullptr && "Callback function cannot be null");
+  auto& system = get();
+  Timers::id_t id;
+  auto real_time = now() + when;
 
-  if (UNLIKELY(free_timers.empty())) {
-
-    if (LIKELY(dead_timers)) {
-      // look for dead timer
-      auto it = scheduled.begin();
-      while (it != scheduled.end()) {
-        // take over this timer, if dead
-        id_t id = it->second;
-
-        if (timers[id].deferred_destruct) {
-          dead_timers--;
-          // remove from schedule
-          scheduled.erase(it);
-          // reset timer
-          timers[id].reset();
-          // reuse timer
-          new (&timers[id]) Timer(period, handler);
-          sched_timer(when, id);
-
-          // Stat increment timer started
-          if(timers[id].is_oneshot())
-            oneshot_started_++;
-          else
-            periodic_started_++;
-
-          return id;
-        }
-        ++it;
-      }
-    }
-    id = timers.size();
+  if (UNLIKELY(system.free_timers.empty()))
+  {
+    id = system.timers.size();
     // occupy new slot
-    timers.emplace_back(period, handler);
+    system.timers.emplace_back(real_time, period, handler);
   }
   else {
     // get free timer slot
-    id = free_timers.back();
-    free_timers.pop_back();
+    id = system.free_timers.back();
+    system.free_timers.pop_back();
 
     // occupy free slot
-    new (&timers[id]) Timer(period, handler);
+    new (&system.timers[id]) SystemTimer(real_time, period, handler);
+  }
+
+  // Stat increment timer started
+  if (system.timers[id].is_oneshot()) {
+    if (system.oneshot_started) (*system.oneshot_started)++;
+  } else {
+    if (system.periodic_started) (*system.periodic_started)++;
   }
 
   // immediately schedule timer
-  sched_timer(when, id);
-
-  // Stat increment timer started
-  if(timers[id].is_oneshot())
-    oneshot_started_++;
-  else
-    periodic_started_++;
-
+  system.sched_timer(real_time, id);
   return id;
 }
 
-void Timers::stop(id_t id)
+void Timers::stop(Timers::id_t id)
 {
-  if (LIKELY(timers[id].deferred_destruct == false)) {
-    // mark as dead already
-    timers[id].deferred_destruct = true;
-    // free resources immediately
-    timers[id].callback.reset();
-    dead_timers++;
+  auto& system = get();
+  if (UNLIKELY(system.timers.at(id).already_dead)) return;
 
-    if (timers[id].is_oneshot())
-      oneshot_stopped_++;
-    else
-      periodic_stopped_++;
+  auto& timer = system.timers[id];
+  // mark as dead already
+  timer.already_dead = true;
+  // free resources immediately
+  timer.callback.reset();
+  // search for timer in scheduled
+  auto it = system.scheduled.find(timer.time);
+  for (; it != system.scheduled.end(); ++it) {
+    // found dead timer
+    if (id == it->second) {
+      // erase from schedule
+      system.scheduled.erase(it);
+      // free from system
+      system.free_timer(id);
+      break;
+    }
   }
+  // timer stats
+  if (system.timers[id].is_oneshot())
+    (*system.oneshot_stopped)++;
+  else
+    (*system.periodic_stopped)++;
 }
 
-size_t Timers::active()
-{
-  return scheduled.size();
+size_t Timers::active() {
+  return get().scheduled.size();
 }
-
-/// time functions ///
-
-inline std::chrono::microseconds now() noexcept
-{
-  return microseconds(OS::micros_since_boot());
+size_t Timers::existing() {
+  return get().timers.size();
+}
+size_t Timers::free() {
+  return get().free_timers.size();
 }
 
 /// scheduling ///
 
 void Timers::timers_handler()
 {
+  auto& system = get();
   // assume the hardware timer called this function
-  is_running = false;
+  system.is_running = false;
 
-  while (LIKELY(!scheduled.empty()))
+  while (LIKELY(!system.scheduled.empty()))
   {
-    auto it = scheduled.begin();
-    auto when = it->first;
-    id_t id   = it->second;
+    auto it         = system.scheduled.begin();
+    auto when       = it->first;
+    Timers::id_t id = it->second;
 
-    // remove dead timers
-    if (timers[id].deferred_destruct) {
-      dead_timers--;
-      // remove from schedule
-      scheduled.erase(it);
-      // delete timer
-      timers[id].reset();
-      free_timers.push_back(id);
-    }
-    else
-    {
-      auto ts_now = now();
+    auto ts_now = now();
+    if (ts_now >= when) {
+      // erase immediately
+      system.scheduled.erase(it);
 
-      if (ts_now >= when) {
-        // erase immediately
-        scheduled.erase(it);
+      // call the users callback function
+      system.timers[id].callback(id);
+      // if the timers struct was modified in callback, eg. due to
+      // creating a timer, then the timer reference below would have
+      // been invalidated, hence why its BELOW, AND MUST STAY THERE
+      auto& timer = system.timers[id];
 
-        // call the users callback function
-        timers[id].callback(id);
-        // if the timers struct was modified in callback, eg. due to
-        // creating a timer, then the timer reference below would have
-        // been invalidated, hence why its BELOW, AND MUST STAY THERE
-        auto& timer = timers[id];
-
-        // oneshot timers are automatically freed
-        if (timer.deferred_destruct || timer.is_oneshot())
-        {
-          timer.reset();
-          if (timer.deferred_destruct) dead_timers--;
-          free_timers.push_back(id);
-        }
-        else if (timer.is_oneshot() == false)
-        {
-          // if the timer is recurring, we will simply reschedule it
-          // NOTE: we are carefully using (when + period) to avoid drift
-          scheduled.emplace(std::piecewise_construct,
-                    std::forward_as_tuple(when + timer.period),
-                    std::forward_as_tuple(id));
-        }
-
-      } else {
-        // not yet time, so schedule it for later
-        is_running = true;
-        arch_start_func(when - ts_now);
-        // exit early, because we have nothing more to do,
-        // and there is a deferred handler
-        return;
+      // oneshot timers are automatically freed
+      if (timer.already_dead || timer.is_oneshot())
+      {
+        system.free_timer(id);
       }
+      else
+      {
+        // if the timer is recurring, we will simply reschedule it
+        // NOTE: we are carefully using (when + period) to avoid drift
+        auto new_time = when + timer.period;
+        // update timers self-time
+        timer.time = new_time;
+        // reschedule
+        system.scheduled.
+          emplace(std::piecewise_construct,
+                  std::forward_as_tuple(new_time),
+                  std::forward_as_tuple(id));
+      }
+
+    } else {
+      // not yet time, so schedule it for later
+      system.is_running = true;
+      system.arch_start_func(when - ts_now);
+      // exit early, because we have nothing more to do,
+      // and there is a deferred handler
+      return;
     }
   }
   // stop hardware timer, since no timers are enabled
-  arch_stop_func();
+  system.arch_stop_func();
 }
-static void sched_timer(duration_t when, id_t id)
+void timer_system::sched_timer(duration_t when, Timers::id_t id)
 {
-  scheduled.emplace(std::piecewise_construct,
-            std::forward_as_tuple(now() + when),
+  this->scheduled.
+    emplace(std::piecewise_construct,
+            std::forward_as_tuple(when),
             std::forward_as_tuple(id));
 
   // dont start any hardware until after calibration
   if (UNLIKELY(!signal_ready)) return;
 
   // if the hardware timer is not running, try starting it
-  if (UNLIKELY(is_running == false)) {
-    Timers::timers_handler();
+  if (UNLIKELY(this->is_running == false)) {
+    Events::get().trigger_event(this->interrupt);
     return;
   }
   // if the scheduled timer is the new front, restart timer
-  auto it = scheduled.begin();
-  if (it->second == id)
-      Timers::timers_handler();
+  auto it = this->scheduled.begin();
+  if (it->second == id) {
+    Events::get().trigger_event(this->interrupt);
+  }
 }

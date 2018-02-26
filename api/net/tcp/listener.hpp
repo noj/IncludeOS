@@ -24,24 +24,25 @@
 #include "common.hpp"
 #include "connection.hpp"
 #include "packet.hpp"
-#include "socket.hpp"
+
+#include <net/socket.hpp>
 
 namespace net {
+  class TCP;
 namespace tcp {
 
 class Listener {
 public:
   using AcceptCallback       = delegate<bool(Socket)>;
   using ConnectCallback      = Connection::ConnectCallback;
+  using CloseCallback        = delegate<void(Listener&)>;
   using CleanupCallback      = Connection::CleanupCallback;
 
   using SynQueue = std::deque<Connection_ptr>;
 
-  friend class net::TCP;
-
 public:
 
-  Listener(TCP& host, port_t port);
+  Listener(TCP& host, Socket local, ConnectCallback cb = nullptr);
 
   Listener& on_accept(AcceptCallback cb)
   {
@@ -55,25 +56,28 @@ public:
     return *this;
   }
 
-  bool syn_queue_full() const
-  { return syn_queue_.size() >= max_syn_backlog; }
+  bool syn_queue_full() const;
 
   /**
    * @brief Returns the local socket identified with this Listener
-   * @details Creates a temporary identifier for the Listener,
-   * in form of Address to the current stack (TCP) and the port_
-   * @return The local Socket
+   *
+   * @return The local Socket the listener is bound to
    */
-  Socket local() const;
+  Socket local() const noexcept
+  { return local_; }
 
-  port_t port() const
-  { return port_; }
+  port_t port() const noexcept
+  { return local_.port(); }
 
   auto syn_queue_size() const
   { return syn_queue_.size(); }
 
   const SynQueue& syn_queue() const
   { return syn_queue_; }
+
+  std::string to_string() const;
+
+  void close();
 
   /** Delete copy and move constructors.*/
   Listener(Listener&) = delete;
@@ -84,27 +88,22 @@ public:
   Listener operator=(Listener&&) = delete;
 
 private:
-  TCP& host_;
-  const port_t port_;
-  SynQueue syn_queue_;
+  friend class net::TCP;
+  TCP&      host_;
+  Socket    local_;
+  SynQueue  syn_queue_;
 
-  /** */
-  AcceptCallback on_accept_;
-
-  /** */
+  AcceptCallback  on_accept_;
   ConnectCallback on_connect_;
+  CloseCallback   _on_close_;
 
   bool default_on_accept(Socket);
-
-  void default_on_connect(Connection_ptr);
 
   void segment_arrived(Packet_ptr);
 
   void remove(Connection_ptr);
 
   void connected(Connection_ptr);
-
-  std::string to_string() const;
 
 };
 

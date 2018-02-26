@@ -19,7 +19,8 @@
 //#define DEBUG2
 
 #include <kernel/elf.hpp>
-#include <util/fixedvec.hpp>
+#include <util/fixed_vector.hpp>
+#include <common>
 #include <cassert>
 #include <cstdlib>
 #include <cstdint>
@@ -41,24 +42,25 @@ static char dbg_write_buffer[1024];
 struct allocation
 {
   allocation() : addr(0) {}
-  allocation(char* A, size_t S, void* L1, void* L2)
-    :  addr(A), len(S), level1(L1), level2(L2) {}
+  allocation(char* A, size_t S, void* L1, void* L2, void* L3)
+    :  addr(A), len(S), level1(L1), level2(L2), level3(L3) {}
 
   char*  addr;
   size_t len;
   void*  level1;
   void*  level2;
+  void*  level3;
 };
 
 static int enable_debugging = 1;
 static int enable_debugging_verbose = 0;
 static int enable_buffer_protection = 1;
-static fixedvector<allocation, 4096>  allocs;
-static fixedvector<allocation*, 4096> free_allocs;
+static Fixed_vector<allocation,  65536> allocs;
+static Fixed_vector<allocation*, 65536> free_allocs;
 
 // There is a chance of a buffer overrun where this exact value
 // is written, but the chance of that happening is minimal
-static const uint32_t buffer_protection_checksum = 0x5f3759df;
+static const uint64_t buffer_protection_checksum = 0xdeadbeef1badcafe;
 
 extern "C"
 void _enable_heap_debugging(int enabled)
@@ -69,6 +71,11 @@ extern "C"
 void _enable_heap_debugging_verbose(int enabled)
 {
   enable_debugging_verbose = enabled;
+}
+extern "C"
+void _enable_heap_debugging_buffer_protection(int enabled)
+{
+  enable_buffer_protection = enabled;
 }
 extern "C"
 int _get_heap_debugging_buffers_usage()
@@ -115,23 +122,31 @@ void* operator new (std::size_t len) throw(std::bad_alloc)
   }
 
   if (enable_debugging_verbose) {
-    DPRINTF("malloc(%u bytes) == %p\n", len, data);
+    DPRINTF("malloc(%llu bytes) == %p\n", (unsigned long long) len, data);
     safe_print_symbol(1, __builtin_return_address(0));
     safe_print_symbol(2, __builtin_return_address(1));
   }
 
-  if (!data) throw std::bad_alloc();
+  if (UNLIKELY(!data)) {
+      print_backtrace();
+      DPRINTF("malloc(%llu bytes): FAILED\n", (unsigned long long) len);
+      throw std::bad_alloc();
+  }
 
   if (enable_debugging) {
     if (!free_allocs.empty()) {
-      auto* x = free_allocs.pop();
+      auto* x = free_allocs.pop_back();
       new(x) allocation((char*) data, len,
                         __builtin_return_address(0),
-                        __builtin_return_address(1));
+                        __builtin_return_address(1),
+                        __builtin_return_address(2));
+    } else if (!allocs.free_capacity()) {
+      DPRINTF("[WARNING] Internal fixed vectors are FULL, expect bogus double free messages\n");
     } else {
-      allocs.emplace((char*) data, len,
+      allocs.emplace_back((char*) data, len,
                       __builtin_return_address(0),
-                      __builtin_return_address(1));
+                      __builtin_return_address(1),
+                      __builtin_return_address(2));
     }
   }
 
@@ -149,7 +164,7 @@ void* operator new[] (std::size_t n) throw(std::bad_alloc)
   return ::operator new (n);
 }
 
-inline void deleted_ptr(void* ptr)
+inline static void deleted_ptr(void* ptr)
 {
   if (enable_buffer_protection) {
     // Calculate where the real allocation starts (at our first checksum)
@@ -170,7 +185,7 @@ inline void deleted_ptr(void* ptr)
     }
     else if (x->addr == ptr) {
       if (enable_debugging_verbose) {
-        DPRINTF("free(%p) == %u bytes\n", x->addr, x->len);
+        DPRINTF("free(%p) == %llu bytes\n", x->addr, (unsigned long long) x->len);
         safe_print_symbol(1, __builtin_return_address(1));
         safe_print_symbol(2, __builtin_return_address(2));
       }
@@ -203,11 +218,11 @@ inline void deleted_ptr(void* ptr)
       // perfect match
       x->addr = nullptr;
       x->len  = 0;
-      free_allocs.add(x);
+      free_allocs.push_back(x);
     }
     else if (x->addr != ptr) {
-      DPRINTF("[ERROR] Free on misaligned address: %p inside %p:%u",
-             ptr, x->addr, x->len);
+      DPRINTF("[ERROR] Free on misaligned address: %p inside %p:%llu",
+             ptr, x->addr, (unsigned long long) x->len);
       print_backtrace();
       return;
     }
@@ -225,26 +240,30 @@ void operator delete[] (void* ptr) throw()
 
 static void safe_print_symbol(int N, void* addr)
 {
-  char _symbol_buffer[1024];
-  char _btrace_buffer[1024];
+  char _symbol_buffer[2048];
+  char _btrace_buffer[2048];
   auto symb = Elf::safe_resolve_symbol(
               addr, _symbol_buffer, sizeof(_symbol_buffer));
   int len = snprintf(_btrace_buffer, sizeof(_btrace_buffer),
-           "-> [%d] %8x + 0x%.3x: %s\n", \
-           N, symb.addr, symb.offset, symb.name);\
+           "-> [%d] %16p + 0x%.3x: %s\n", \
+           N, (void*) symb.addr, symb.offset, symb.name);\
   write(1, _btrace_buffer, len);
 }
 
-void print_heap_allocations()
+#include <delegate>
+typedef delegate<bool(void*, size_t)> heap_print_func;
+
+void print_heap_allocations(heap_print_func func)
 {
   DPRINTF("Listing %u allocations...\n", allocs.size());
   for (auto& x : allocs) {
-    if (x.addr) {
+    if (x.addr != nullptr && func(x.addr, x.len)) {
       // entry
-      DPRINTF("[%p] %u bytes\n", x.addr, x.len);
+      DPRINTF("[%p] %llu bytes\n", x.addr, (unsigned long long) x.len);
       // backtrace
       safe_print_symbol(1, x.level1);
       safe_print_symbol(2, x.level2);
+      safe_print_symbol(3, x.level3);
     }
   }
 }

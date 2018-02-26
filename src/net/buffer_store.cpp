@@ -15,68 +15,184 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//#define DEBUG
-//#undef  NO_DEBUG
-#include <debug>
-#include <cassert>
+#if !defined(__MACH__)
 #include <malloc.h>
-#include <cstdio>
-
+#else
+#include <cstddef>
+extern void *memalign(size_t, size_t);
+#endif
 #include <net/buffer_store.hpp>
 #include <kernel/syscalls.hpp>
 #include <common>
+#include <cassert>
+#include <smp>
+#include <cstddef>
+//#define DEBUG_RELEASE
+//#define DEBUG_RETRIEVE
+//#define DEBUG_BUFSTORE
+
 #define PAGE_SIZE     0x1000
+#define ENABLE_BUFFERSTORE_CHAIN
+
+
+#ifdef DEBUG_RELEASE
+#define BSD_RELEASE(fmt, ...) printf(fmt, ##__VA_ARGS__);
+#else
+#define BSD_RELEASE(fmt, ...)  /** fmt **/
+#endif
+
+#ifdef DEBUG_RETRIEVE
+#define BSD_GET(fmt, ...) printf(fmt, ##__VA_ARGS__);
+#else
+#define BSD_GET(fmt, ...)  /** fmt **/
+#endif
+
+#ifdef DEBUG_BUFSTORE
+#define BSD_BUF(fmt, ...) printf(fmt, ##__VA_ARGS__);
+#else
+#define BSD_BUF(fmt, ...)  /** fmt **/
+#endif
 
 namespace net {
 
   BufferStore::BufferStore(size_t num, size_t bufsize) :
     poolsize_  {num * bufsize},
-    bufsize_   {bufsize}
+    bufsize_   {bufsize},
+    next_(nullptr)
   {
     assert(num != 0);
     assert(bufsize != 0);
     const size_t DATA_SIZE  = poolsize_;
 
-    this->pool_ = (buffer_t) memalign(PAGE_SIZE, DATA_SIZE);
+    this->pool_ = (uint8_t*) memalign(PAGE_SIZE, DATA_SIZE);
     assert(this->pool_);
 
     available_.reserve(num);
-    for (buffer_t b = pool_end()-bufsize; b >= pool_begin(); b -= bufsize) {
+    for (uint8_t* b = pool_end()-bufsize; b >= pool_begin(); b -= bufsize) {
         available_.push_back(b);
     }
+    assert(available_.capacity() == num);
     assert(available() == num);
-    // verify that the "first" buffer is the start of the pool
-    assert(available_.back() == pool_);
+
+    static int bsidx = 0;
+    this->index = ++bsidx;
   }
 
   BufferStore::~BufferStore() {
+    delete this->next_;
     free(this->pool_);
   }
 
-  BufferStore::buffer_t BufferStore::get_buffer() {
-    if (UNLIKELY(available_.empty())) {
-      panic("<BufferStore> Storage pool full! Don't know how to increase pool size yet.\n");
+  size_t BufferStore::available() const noexcept
+  {
+    auto avail = this->available_.size();
+#ifdef ENABLE_BUFFERSTORE_CHAIN
+    auto* parent = this;
+    while (parent->next_ != nullptr) {
+        parent = parent->next_;
+        avail += parent->available_.size();
     }
-
-    auto addr = available_.back();
-    available_.pop_back();
-    return addr;
+#endif
+    return avail;
+  }
+  size_t BufferStore::total_buffers() const noexcept
+  {
+    size_t total = this->local_buffers();
+#ifdef ENABLE_BUFFERSTORE_CHAIN
+    auto* parent = this;
+    while (parent->next_ != nullptr) {
+        parent = parent->next_;
+        total += parent->local_buffers();
+    }
+#endif
+    return total;
   }
 
-  void BufferStore::release(void* addr)
+  BufferStore* BufferStore::get_next_bufstore()
   {
-    buffer_t buff = (buffer_t) addr;
-    debug("Release %p...", buff);
-
-    // expensive: is_buffer(buff)
-    if (LIKELY(is_from_pool(buff))) {
-      available_.push_back(buff);
-      debug("released\n");
-      return;
+#ifdef ENABLE_BUFFERSTORE_CHAIN
+    BufferStore* parent = this;
+    while (parent->next_ != nullptr) {
+        parent = parent->next_;
+        if (!parent->available_.empty()) return parent;
     }
-    // buffer not owned by bufferstore, so just delete it?
-    debug("deleted\n");
-    delete[] buff;
+    BSD_BUF("<BufferStore> Allocating %lu new buffers (%lu total)\n",
+            local_buffers(), total_buffers() + local_buffers());
+    parent->next_ = new BufferStore(local_buffers(), bufsize());
+    return parent->next_;
+#else
+    return nullptr;
+#endif
+  }
+
+  BufferStore::buffer_t BufferStore::get_buffer_directly() noexcept
+  {
+    auto addr = available_.back();
+    available_.pop_back();
+    return { this, addr };
+  }
+
+  BufferStore::buffer_t BufferStore::get_buffer()
+  {
+#ifndef INCLUDEOS_SINGLE_THREADED
+    scoped_spinlock spinlock(plock);
+#endif
+
+    if (UNLIKELY(available_.empty())) {
+#ifdef ENABLE_BUFFERSTORE_CHAIN
+      auto* next = get_next_bufstore();
+      if (next == nullptr)
+          throw std::runtime_error("Unable to create new bufstore");
+
+      // take buffer from external bufstore
+      auto buffer = next->get_buffer_directly();
+      BSD_GET("%d: Gave away EXTERN %p, %lu buffers remain\n",
+              this->index, buffer.addr, available());
+      return buffer;
+#else
+      panic("<BufferStore> Buffer pool empty! Not configured to increase pool size.\n");
+#endif
+    }
+
+    auto buffer = get_buffer_directly();
+    BSD_GET("%d: Gave away %p, %lu buffers remain\n",
+            this->index, buffer.addr, available());
+    return buffer;
+  }
+
+  void BufferStore::release_internal(void* addr)
+  {
+    auto* buff = (uint8_t*) addr;
+    BSD_RELEASE("%d: Release %p -> ", this->index, buff);
+
+#ifndef INCLUDEOS_SINGLE_THREADED
+    scoped_spinlock spinlock(plock);
+#endif
+#ifdef ENABLE_BUFFERSTORE_CHAIN
+    // try to release buffer on linked bufferstore
+    BufferStore* ptr = next_;
+    while (ptr != nullptr) {
+      if (ptr->is_from_this_pool(buff)) {
+        BSD_RELEASE("released on other bufferstore\n");
+        ptr->release_directly(buff);
+        return;
+      }
+      ptr = ptr->next_;
+    }
+#endif
+    throw std::runtime_error("Packet did not belong");
+  }
+
+  void BufferStore::release_directly(uint8_t* buffer)
+  {
+    BSD_GET("%d: Released EXTERN %p, %lu buffers remain\n",
+            this->index, buffer, available());
+    available_.push_back(buffer);
+  }
+
+  void BufferStore::move_to_this_cpu() noexcept
+  {
+    // TODO: hmm
   }
 
 } //< namespace net

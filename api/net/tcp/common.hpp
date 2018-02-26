@@ -21,17 +21,29 @@
 
 #include <net/ip4/addr.hpp>
 #include <net/packet.hpp>
+#include <net/checksum.hpp>
+#include <chrono>
 
 namespace net {
   namespace tcp {
 
     // Constants
     // default size of TCP window - how much data can be "in flight" (unacknowledged)
-    static constexpr uint16_t default_window_size = 0xffff;
+    static constexpr uint16_t default_window_size {0xffff};
+    // window scaling + window size
+    static constexpr uint8_t  default_window_scaling {5};
+    static constexpr uint32_t default_ws_window_size {8192 << default_window_scaling};
+    // use of timestamps option
+    static constexpr bool     default_timestamps {true};
     // maximum size of a TCP segment - later set based on MTU or peer
-    static constexpr uint16_t default_mss = 536;
+    static constexpr uint16_t default_mss {536};
     // the maximum amount of half-open connections per port (listener)
-    static constexpr size_t max_syn_backlog = 64;
+    static constexpr size_t   default_max_syn_backlog {64};
+    // clock granularity of the timestamp value clock
+    static constexpr float   clock_granularity {0.0001};
+
+    static const std::chrono::seconds       default_msl {30};
+    static const std::chrono::milliseconds  default_dack_timeout {40};
 
     using Address = ip4::Addr;
 
@@ -42,22 +54,38 @@ namespace net {
     using seq_t = uint32_t;
 
     /** A shared buffer pointer */
-    using buffer_t = std::shared_ptr<uint8_t>;
+    using buffer_t = std::shared_ptr<std::vector<uint8_t>>;
 
-    /**
-     * @brief Creates a shared buffer with a given length
-     *
-     * @param length buffer length
-     * @return a newly created buffer_t
-     */
-    static buffer_t new_shared_buffer(uint64_t length)
-    { return buffer_t(new uint8_t[length], std::default_delete<uint8_t[]>()); }
+    /** Construct a shared vector used in TCP **/
+    template <typename... Args>
+    buffer_t construct_buffer(Args&&... args) {
+      return std::make_shared<std::vector<uint8_t>> (std::forward<Args> (args)...);
+    }
 
     class Packet;
     using Packet_ptr = std::unique_ptr<Packet>;
 
     class Connection;
     using Connection_ptr = std::shared_ptr<Connection>;
+
+    template <typename Tcp_packet>
+    uint16_t calculate_checksum(const Tcp_packet& packet)
+    {
+      constexpr uint8_t Proto_TCP = 6; // avoid including inet_common
+      uint16_t length = packet.tcp_length();
+      // Compute sum of pseudo-header
+      uint32_t sum =
+            (packet.ip_src().whole >> 16)
+          + (packet.ip_src().whole & 0xffff)
+          + (packet.ip_dst().whole >> 16)
+          + (packet.ip_dst().whole & 0xffff)
+          + (Proto_TCP << 8)
+          + htons(length);
+
+      // Compute sum of header and data
+      const char* buffer = (char*) &packet.tcp_header();
+      return net::checksum(sum, buffer, length);
+    }
 
   } // < namespace tcp
 } // < namespace net

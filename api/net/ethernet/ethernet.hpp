@@ -20,10 +20,10 @@
 #define NET_ETHERNET_HPP
 
 #include <string>
-
 #include "header.hpp"
-#include <hw/nic.hpp>
-#include <hw/mac_addr.hpp>
+#include "ethertype.hpp"
+#include <hw/mac_addr.hpp> // ethernet address
+#include <hw/nic.hpp> // protocol
 #include <net/inet_common.hpp>
 
 namespace net {
@@ -33,94 +33,105 @@ namespace net {
   public:
     static constexpr size_t MINIMUM_PAYLOAD = 46;
 
-    /**
-     *  Some big-endian ethernet types
-     *
-     *  From http://en.wikipedia.org/wiki/EtherType
-     */
-    enum ethertype_le {
-      _ETH_IP4   = 0x0800,
-      _ETH_ARP   = 0x0806,
-      _ETH_WOL   = 0x0842,
-      _ETH_IP6   = 0x86DD,
-      _ETH_FLOW  = 0x8808,
-      _ETH_JUMBO = 0x8870
-    };
-
-    /** Little-endian ethertypes. */
-    enum ethertype {
-      ETH_IP4   = 0x8,
-      ETH_ARP   = 0x608,
-      ETH_WOL   = 0x4208,
-      ETH_IP6   = 0xdd86,
-      ETH_FLOW  = 0x888,
-      ETH_JUMBO = 0x7088,
-      ETH_VLAN  = 0x81
-    };
-
     // MAC address
-    using addr = hw::MAC_addr;
-
-    static const addr MULTICAST_FRAME;
-    static const addr BROADCAST_FRAME;
-
-    static const addr IPv6mcast_01;
-    static const addr IPv6mcast_02;
+    using addr = MAC::Addr;
 
     /** Constructor */
-    explicit Ethernet(hw::Nic& nic) noexcept;
+    explicit Ethernet(
+          downstream physical_downstream,
+          const addr& mac) noexcept;
 
     using header  = ethernet::Header;
     using trailer = ethernet::trailer_t;
 
+    // The link-layer decices the devices name due to construction order
+    std::string link_name() const {
+      return "eth" + std::to_string(ethernet_idx);
+    }
+
     /** Bottom upstream input, "Bottom up". Handle raw ethernet buffer. */
-    void bottom(Packet_ptr);
+    void receive(Packet_ptr);
 
-    /** Delegate upstream ARP handler. */
-    void set_arp_handler(upstream del)
-    { arp_handler_ = del; }
 
-    upstream get_arp_handler()
-    { return arp_handler_; }
+    /** Protocol handler getters */
+    upstream_ip& ip4_upstream()
+    { return ip4_upstream_; }
 
-    /** Delegate upstream IPv4 handler. */
-    void set_ip4_handler(upstream del)
-    { ip4_handler_ = del; }
+    upstream_ip& ip6_upstream()
+    { return ip6_upstream_; }
 
-    /** Delegate upstream IPv4 handler. */
-    upstream get_ip4_handler()
-    { return ip4_handler_; }
+    upstream& arp_upstream()
+    { return arp_upstream_; }
 
-    /** Delegate upstream IPv6 handler. */
-    void set_ip6_handler(upstream del)
-    { ip6_handler_ = del; };
+
+    /** Delegate upstream IPv4 upstream. */
+    void set_ip4_upstream(upstream_ip del)
+    { ip4_upstream_ = del; }
+
+    /** Delegate upstream IPv6 upstream. */
+    void set_ip6_upstream(upstream_ip del)
+    { ip6_upstream_ = del; };
+
+    /** Delegate upstream ARP upstream. */
+    void set_arp_upstream(upstream del)
+    { arp_upstream_ = del; }
+
+
+    /**
+     * @brief      Sets the vlan upstream.
+     *
+     * @param[in]  del   The upstream delegate
+     */
+    void set_vlan_upstream(upstream del)
+    { vlan_upstream_ = del; }
 
     /** Delegate downstream */
-    void set_physical_out(downstream del)
-    { physical_out_ = del; }
+    void set_physical_downstream(downstream del)
+    { physical_downstream_ = del; }
 
-    /** @return Mac address of the underlying device */
-    const auto& mac() const noexcept
-    { return nic_.mac(); }
+    downstream& physical_downstream()
+    { return physical_downstream_; }
+
+    static constexpr uint16_t header_size() noexcept
+    { return sizeof(ethernet::Header); }
+
+    static constexpr hw::Nic::Proto proto() noexcept
+    { return hw::Nic::Proto::ETH; }
 
     /** Transmit data, with preallocated space for eth.header */
-    void transmit(Packet_ptr);
+    void transmit(Packet_ptr, addr dest, Ethertype);
 
-  private:
-    hw::Nic& nic_;
+    /** Stats getters **/
+    uint64_t get_packets_rx()
+    { return packets_rx_; }
+
+    uint64_t get_packets_tx()
+    { return packets_tx_; }
+
+    uint64_t get_packets_dropped()
+    { return packets_dropped_; }
+
+    uint32_t get_trailer_packets_dropped()
+    { return trailer_packets_dropped_; }
+
+  protected:
+    const addr& mac_;
+    int   ethernet_idx;
 
     /** Stats */
     uint64_t& packets_rx_;
     uint64_t& packets_tx_;
     uint32_t& packets_dropped_;
+    uint32_t& trailer_packets_dropped_;
 
     /** Upstream OUTPUT connections */
-    upstream ip4_handler_ = [](Packet_ptr){};
-    upstream ip6_handler_ = [](Packet_ptr){};
-    upstream arp_handler_ = [](Packet_ptr){};
+    upstream_ip ip4_upstream_ = nullptr;
+    upstream_ip ip6_upstream_ = nullptr;
+    upstream arp_upstream_ = nullptr;
+    upstream vlan_upstream_ = nullptr;
 
     /** Downstream OUTPUT connection */
-    downstream physical_out_ = [](Packet_ptr){};
+    downstream physical_downstream_ = [](Packet_ptr){};
 
     /*
 

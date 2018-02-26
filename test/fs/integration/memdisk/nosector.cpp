@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <os>
+#include <service>
 #include <stdio.h>
 #include <cassert>
 
@@ -24,7 +24,7 @@
 void Service::start(const std::string&)
 {
   INFO("MemDisk", "Running tests for MemDisk");
-  auto disk = fs::new_shared_memdisk();
+  auto disk = fs::shared_memdisk();
   CHECKSERT(disk, "Created shared memdisk");
 
   // verify that the size is indeed 0 sectors

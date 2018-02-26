@@ -2,7 +2,8 @@
 #define DEBUG2
 #include "virtioblk.hpp"
 
-#include <kernel/irq_manager.hpp>
+#include <kernel/events.hpp>
+#include <fs/common.hpp>
 #include <hw/pci.hpp>
 #include <cassert>
 #include <stdlib.h>
@@ -34,17 +35,17 @@ void null_deleter(uint8_t*) {};
 #include <statman>
 
 VirtioBlk::VirtioBlk(hw::PCI_Device& d)
-  : Virtio(d), hw::Drive(), req(queue_size(0), 0, iobase()), inflight(0)
+  : Virtio(d), hw::Block_device(), req(device_name() + ".req0", queue_size(0), 0, iobase()), inflight(0)
 {
-  INFO("VirtioBlk", "Driver initializing");
+  INFO("VirtioBlk", "Block_devicer initializing");
   {
     auto& reqs = Statman::get().create(
-      Stat::UINT32, blkname() + ".requests");
+      Stat::UINT32, device_name() + ".requests");
     this->requests = &reqs.get_uint32();
     *this->requests = 0;
 
     auto& err = Statman::get().create(
-      Stat::UINT32, blkname() + ".errors");
+      Stat::UINT32, device_name() + ".errors");
     this->errors = &err.get_uint32();
     *this->errors = 0;
   }
@@ -74,9 +75,9 @@ VirtioBlk::VirtioBlk(hw::PCI_Device& d)
          "Negotiated needed features");
 
   // Step 1 - Initialize REQ queue
-  auto success = assign_queue(0, (uint32_t) req.queue_desc());
-  CHECK(success, "Request queue assigned (0x%x) to device",
-        (uint32_t) req.queue_desc());
+  auto success = assign_queue(0, req.queue_desc());
+  CHECK(success, "Request queue assigned (%p) to device",
+        req.queue_desc());
 
   // Step 3 - Fill receive queue with buffers
   // DEBUG: Disable
@@ -91,16 +92,18 @@ VirtioBlk::VirtioBlk(hw::PCI_Device& d)
   CHECK((features() & needed_features) == needed_features, "Signalled driver OK");
 
   // Hook up IRQ handler (inherited from Virtio)
-  if (is_msix())
+  if (has_msix())
   {
+    assert(get_msix_vectors() >= 2);
+    auto& irqs = this->get_irqs();
     // update IRQ subscriptions
-    IRQ_manager::get().subscribe(irq() + 0, {this, &VirtioBlk::service_RX});
-    IRQ_manager::get().subscribe(irq() + 1, {this, &VirtioBlk::msix_conf_handler});
+    Events::get().subscribe(irqs[0], {this, &VirtioBlk::service_RX});
+    Events::get().subscribe(irqs[1], {this, &VirtioBlk::msix_conf_handler});
   }
   else
   {
-    auto del(delegate<void()>{this, &VirtioBlk::irq_handler});
-    IRQ_manager::get().subscribe(irq(), del);
+    auto& irqs = this->get_irqs();
+    Events::get().subscribe(irqs[0], {this, &VirtioBlk::irq_handler});
   }
 
   // Done
@@ -142,10 +145,10 @@ void VirtioBlk::irq_handler() {
     get_config();
     //debug("\t             New status: 0x%x \n", config.status);
   }
-
 }
 
-void VirtioBlk::handle(request_t* hdr) {
+void VirtioBlk::handle(request_t* hdr)
+{
   // check request response
   blk_resp_t& resp = hdr->resp;
   // only call handler with data when the request was fullfilled
@@ -153,22 +156,20 @@ void VirtioBlk::handle(request_t* hdr) {
   //      resp.status, hdr->hdr.sector, resp.handler.get_ptr(), hdr->io.sector);
 
   if (resp.status == 0) {
-    // give the whole request to user:
     // packaged as buffer, but deleted as request
-    auto buf = buffer_t(hdr->io.sector, [] (uint8_t* buffer) {
-      delete (request_t*) (buffer -  sizeof(scsi_header_t));
-    });
-    // call handler with buffer only as size is implicit
-    resp.handler(buf);
+    resp.handler(hdr->io.sector);
   }
   else {
     // return empty shared ptr
-    resp.handler(buffer_t());
+    resp.handler(nullptr);
   }
+
+  // delete request
+  delete hdr;
 }
 
-void VirtioBlk::service_RX() {
-
+void VirtioBlk::service_RX()
+{
   req.disable_interrupts();
   while (req.new_incoming())
   {
@@ -217,7 +218,15 @@ void VirtioBlk::shipit(request_t* vbr) {
 
 void VirtioBlk::read (block_t blk, on_read_func func) {
   // Virtio Std. § 5.1.6.3
-  auto* vbr = new request_t(blk, func);
+  auto* vbr = new request_t(blk,
+    request_handler_t::make_packed(
+    [this, func] (uint8_t* data) {
+      if (data != nullptr)
+        func(fs::construct_buffer(data, data + block_size()));
+      else
+        func(nullptr);
+    }));
+
   if (free_space()) {
     shipit(vbr);
     req.kick();
@@ -226,12 +235,11 @@ void VirtioBlk::read (block_t blk, on_read_func func) {
     jobs.push_back(vbr);
   }
 }
-void VirtioBlk::read (block_t blk, size_t cnt, on_read_func func) {
-
+void VirtioBlk::read (block_t blk, size_t cnt, on_read_func func)
+{
   // create big buffer for collecting all the disk data
-  uint8_t* bufdata = new uint8_t[block_size() * cnt];
-  buffer_t bigbuf { bufdata, std::default_delete<uint8_t[]>() };
-  // (initialized) boolean array of partial jobs
+  auto bigbuf = fs::construct_buffer(block_size() * cnt);
+  // number of reads left
   auto results = std::make_shared<size_t> (cnt);
   bool shipped = false;
   //printf("virtioblk: Enqueue blk %llu cnt %u\n", blk, cnt);
@@ -240,32 +248,35 @@ void VirtioBlk::read (block_t blk, size_t cnt, on_read_func func) {
   for (size_t i = 0; i < cnt; i++)
   {
     // create a special request where we collect all the data
-    auto* vbr = new request_t(blk + i,
-    [this, i, func, results, bigbuf] (buffer_t buffer) {
-      // if the job was already completed, return early
-      if (*results == 0) {
-        printf("Job cancelled? results == 0,  blk=%u\n", i);
-        return;
-      }
-      // validate partial result
-      if (buffer) {
-        *results -= 1;
-        // copy partial block
-        memcpy(bigbuf.get() + i * block_size(), buffer.get(), block_size());
-        // check if we have all blocks
+    auto* vbr = new request_t(
+      blk + i,
+      request_handler_t::make_packed(
+      [this, i, func, results, bigbuf] (uint8_t* data) {
+        // if the job was already completed, return early
         if (*results == 0) {
-          // finally, call user-provided callback
-          func(bigbuf);
+          printf("Job cancelled? results == 0,  blk=%u\n", i);
+          return;
         }
-      }
-      else {
-        (*this->errors)++;
-        // if the partial result failed, cancel all
-        *results = 0;
-        // callback with no data
-        func(buffer_t());
-      }
-    });
+        // validate partial result
+        if (data != nullptr) {
+          *results -= 1;
+          // copy partial block
+          memcpy(bigbuf->data() + i * block_size(), data, block_size());
+          // check if we have all blocks
+          if (*results == 0) {
+            // finally, call user-provided callback
+            func(bigbuf);
+          }
+        }
+        else {
+          (*this->errors)++;
+          // if the partial result failed, cancel all
+          *results = 0;
+          // callback with no data
+          func(nullptr);
+        }
+      })
+    );
     //printf("virtioblk: Enqueue blk %llu\n", blk + i);
     //
     if (free_space()) {
@@ -279,7 +290,7 @@ void VirtioBlk::read (block_t blk, size_t cnt, on_read_func func) {
   if (shipped) req.kick();
 }
 
-VirtioBlk::request_t::request_t(uint64_t blk, on_read_func cb)
+VirtioBlk::request_t::request_t(uint64_t blk, request_handler_t cb)
 {
   hdr.type   = VIRTIO_BLK_T_IN;
   hdr.ioprio = 0; // reserved
@@ -288,11 +299,20 @@ VirtioBlk::request_t::request_t(uint64_t blk, on_read_func cb)
   resp.handler = cb;
 }
 
+void VirtioBlk::deactivate()
+{
+  /// disable interrupts on virtio queues
+  req.disable_interrupts();
+
+  /// reset device
+  this->Virtio::reset();
+}
+
 #include <kernel/pci_manager.hpp>
 
 /** Global constructor - register VirtioBlk's driver factory at the PCI_manager */
 struct Autoreg_virtioblk {
   Autoreg_virtioblk() {
-    PCI_manager::register_driver<hw::Drive>(hw::PCI_Device::VENDOR_VIRTIO, 0x1001, &VirtioBlk::new_instance);
+    PCI_manager::register_blk(PCI::VENDOR_VIRTIO, 0x1001, &VirtioBlk::new_instance);
   }
 } autoreg_virtioblk;

@@ -20,60 +20,52 @@
 
 #include <vector>
 
+using namespace net;
 using namespace net::tcp;
 
-WriteQueue::WriteRequest create_write_request(
-  uint64_t size,
-  WriteQueue::WriteCallback cb = [](size_t n) {})
+inline static auto create_write_request(size_t size)
 {
-  WriteBuffer wb { new_shared_buffer(size), size, true };
-  return { wb, cb };
+  return tcp::construct_buffer(size);
 }
 
 CASE("Creating a WriteQueue and operate it")
 {
   GIVEN("An empty WriteQueue")
   {
-    WriteQueue wq;
+    Write_queue wq;
 
     EXPECT( wq.empty() );
-    EXPECT( wq.size() == 0 );
-    EXPECT( wq.current() == 0 );
+    EXPECT( wq.size() == 0u );
+    EXPECT( wq.current() == 0u );
 
     EXPECT_THROWS_AS( wq.nxt(), std::out_of_range );
     EXPECT_THROWS_AS( wq.una(), std::out_of_range );
 
-    EXPECT( wq.bytes_total() == 0 );
-    EXPECT( wq.bytes_remaining() == 0 );
-    EXPECT( wq.bytes_unacknowledged() == 0 );
+    EXPECT( wq.bytes_total() == 0u );
+    EXPECT( wq.bytes_remaining() == 0u );
+    EXPECT( wq.bytes_unacknowledged() == 0u );
 
     WHEN("A WriteRequest is inserted")
     {
       const uint32_t len = 1000;
-      uint32_t written = 0;
-      auto callback =
-      [&written, len]
-      (size_t n) {
-        written = n;
-      };
-      auto wr = create_write_request(len, callback);
+      auto wr = create_write_request(len);
       wq.push_back(wr);
 
       THEN("The size is increased, it has remaining requests, nxt() & una() points to the same buffer, but current stays the same")
       {
         EXPECT( not wq.empty() );
-        EXPECT( wq.size() == 1 );
+        EXPECT( wq.size() == 1u );
 
-        EXPECT( wq.remaining_requests() );
+        EXPECT( wq.has_remaining_requests() );
 
-        EXPECT( wq.current() == 0 );
+        EXPECT( wq.current() == 0u );
 
-        EXPECT( wq.nxt() == wr.first );
-        EXPECT( wq.una() == wr.first );
+        EXPECT( wq.nxt() == wr );
+        EXPECT( wq.una() == wr );
 
-        EXPECT( wq.bytes_total() == 1000 );
-        EXPECT( wq.bytes_remaining() == 1000 );
-        EXPECT( wq.bytes_unacknowledged() == 1000 );
+        EXPECT( wq.bytes_total() == 1000u );
+        EXPECT( wq.bytes_remaining() == 1000u );
+        EXPECT( wq.bytes_unacknowledged() == 1000u );
 
         WHEN("The queue is advanced by 1000 bytes")
         {
@@ -81,19 +73,17 @@ CASE("Creating a WriteQueue and operate it")
 
           THEN("The queue has no remaining requests, user callback should be complete, and current should be 1")
           {
-            EXPECT( not wq.remaining_requests() );
+            EXPECT( not wq.has_remaining_requests() );
             EXPECT( not wq.empty() );
 
-            EXPECT( written == len );
-
-            EXPECT( wq.current() == 1 );
+            EXPECT( wq.current() == 1u );
 
             EXPECT_THROWS_AS( wq.nxt(), std::out_of_range );
-            EXPECT( wq.una() == wr.first );
+            EXPECT( wq.una() == wr );
 
-            EXPECT( wq.bytes_total() == 1000 );
-            EXPECT( wq.bytes_remaining() == 0 );
-            EXPECT( wq.bytes_unacknowledged() == 1000 );
+            EXPECT( wq.bytes_total() == 1000u );
+            EXPECT( wq.bytes_remaining() == 0u );
+            EXPECT( wq.bytes_unacknowledged() == 1000u );
 
             WHEN("The queue is acknowledged with 1000 bytes")
             {
@@ -103,11 +93,11 @@ CASE("Creating a WriteQueue and operate it")
               {
                 EXPECT( wq.empty() );
 
-                EXPECT( wq.current() == 0 );
+                EXPECT( wq.current() == 0u );
 
-                EXPECT( wq.bytes_total() == 0 );
-                EXPECT( wq.bytes_remaining() == 0 );
-                EXPECT( wq.bytes_unacknowledged() == 0 );
+                EXPECT( wq.bytes_total() == 0u );
+                EXPECT( wq.bytes_remaining() == 0u );
+                EXPECT( wq.bytes_unacknowledged() == 0u );
               }
             }
           }
@@ -124,9 +114,7 @@ CASE("Creating a WriteQueue and operate it")
         {
           EXPECT( wq.empty() );
 
-          EXPECT( written == 200 );
-
-          EXPECT( wq.current() == 0 );
+          EXPECT( wq.current() == 0u );
 
           EXPECT_THROWS_AS( wq.nxt(), std::out_of_range );
 
@@ -136,8 +124,8 @@ CASE("Creating a WriteQueue and operate it")
 
             THEN("Everything is fine")
             {
-              EXPECT( wq.current() == 0 );
-              EXPECT( wq.size() == 1 );
+              EXPECT( wq.current() == 0u );
+              EXPECT( wq.size() == 1u );
               EXPECT_NO_THROW( wq.nxt() );
             }
           }
@@ -149,30 +137,30 @@ CASE("Creating a WriteQueue and operate it")
       const uint32_t N = 5;
       const uint32_t len = 1000;
 
-      std::vector<WriteQueue::WriteRequest> reqs;
-      std::vector<size_t> written = { 1, 1, 1, 1, 1 };
+      std::vector<net::tcp::buffer_t> reqs;
       for(int i = 0; i < N; i++) {
-        reqs.emplace_back(
-          create_write_request(len,
-            [&written, i](size_t n) {
-              written[i] = n;
-            })
-        );
+        reqs.emplace_back(create_write_request(len));
         wq.push_back(reqs[i]);
       }
+
+      std::vector<size_t> written = { 0, 0, 0, 0, 0 };
+      int i = 0;
+      wq.on_write([&written, &i](size_t n) mutable {
+        written[i++] = n;
+      });
 
       THEN("The size is increased, and nxt() and una() points to the first element")
       {
         EXPECT( wq.size() == N );
 
-        EXPECT( wq.current() == 0 );
+        EXPECT( wq.current() == 0u );
 
-        EXPECT( wq.nxt() == reqs[0].first );
-        EXPECT( wq.una() == reqs[0].first );
+        EXPECT( wq.nxt() == reqs[0] );
+        EXPECT( wq.una() == reqs[0] );
 
-        EXPECT( wq.bytes_total() == 5000 );
-        EXPECT( wq.bytes_remaining() == 5000 );
-        EXPECT( wq.bytes_unacknowledged() == 5000 );
+        EXPECT( wq.bytes_total() == 5000u );
+        EXPECT( wq.bytes_remaining() == 5000u );
+        EXPECT( wq.bytes_unacknowledged() == 5000u );
 
         WHEN("Advanced with 2500 bytes")
         {
@@ -182,14 +170,14 @@ CASE("Creating a WriteQueue and operate it")
 
           THEN("The nxt() is the third element and una() is still the first element, current is 2")
           {
-            EXPECT( wq.nxt() == reqs[2].first );
-            EXPECT( wq.una() == reqs[0].first );
+            EXPECT( wq.nxt() == reqs[2] );
+            EXPECT( wq.una() == reqs[0] );
 
-            EXPECT( wq.current() == 2 );
+            EXPECT( wq.current() == 2u );
 
-            EXPECT( wq.bytes_total() == 5000 );
-            EXPECT( wq.bytes_remaining() == 2500 );
-            EXPECT( wq.bytes_unacknowledged() == 5000 );
+            EXPECT( wq.bytes_total() == 5000u );
+            EXPECT( wq.bytes_remaining() == 2500u );
+            EXPECT( wq.bytes_unacknowledged() == 5000u );
 
             WHEN("Acknowledged with 2500 bytes")
             {
@@ -197,41 +185,41 @@ CASE("Creating a WriteQueue and operate it")
 
               THEN("nxt() and una() is the third element, size has shrunk to 3, and current is 0")
               {
-                EXPECT( wq.nxt() == reqs[2].first );
+                EXPECT( wq.nxt() == reqs[2] );
                 EXPECT( wq.nxt() == wq.una() );
 
-                EXPECT( wq.size() == 3 );
-                EXPECT( wq.current() == 0 );
+                EXPECT( wq.size() == 3u );
+                EXPECT( wq.current() == 0u );
 
-                EXPECT( wq.remaining_requests() );
+                EXPECT( wq.has_remaining_requests() );
 
-                EXPECT( wq.bytes_total() == 3000 );
-                EXPECT( wq.bytes_remaining() == 2500 );
-                EXPECT( wq.bytes_unacknowledged() == 2500 );
+                EXPECT( wq.bytes_total() == 3000u );
+                EXPECT( wq.bytes_remaining() == 2500u );
+                EXPECT( wq.bytes_unacknowledged() == 2500u );
 
                 WHEN("The queue is reset")
                 {
                   wq.reset();
 
-                  THEN("The queue is empty and the callbacks has returned correct values [1000, 1000, 500, 0, 0]")
+                  THEN("The queue is empty and on write has returned correct values on the fully/half completed ones [1000, 1000, 500]")
                   {
                     EXPECT( wq.empty() );
-                    EXPECT( wq.size() == 0 );
-                    EXPECT( not wq.remaining_requests() );
-                    EXPECT( wq.current() == 0 );
+                    EXPECT( wq.size() == 0u );
+                    EXPECT( not wq.has_remaining_requests() );
+                    EXPECT( wq.current() == 0u );
 
                     EXPECT_THROWS_AS( wq.nxt(), std::out_of_range );
                     EXPECT_THROWS_AS( wq.una(), std::out_of_range );
 
-                    EXPECT( written[0] == 1000 );
-                    EXPECT( written[1] == 1000 );
-                    EXPECT( written[2] == 500 );
-                    EXPECT( written[3] == 0 );
-                    EXPECT( written[4] == 0 );
+                    EXPECT( written[0] == 1000u );
+                    EXPECT( written[1] == 1000u );
+                    EXPECT( written[2] == 500u );
+                    EXPECT( written[3] == 0u );
+                    EXPECT( written[4] == 0u );
 
-                    EXPECT( wq.bytes_total() == 0 );
-                    EXPECT( wq.bytes_remaining() == 0 );
-                    EXPECT( wq.bytes_unacknowledged() == 0 );
+                    EXPECT( wq.bytes_total() == 0u );
+                    EXPECT( wq.bytes_remaining() == 0u );
+                    EXPECT( wq.bytes_unacknowledged() == 0u );
                   }
                 }
               }

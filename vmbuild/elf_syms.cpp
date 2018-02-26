@@ -1,21 +1,22 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cassert>
-#include "elf.h"
+#include <vector>
+#include "../api/util/elf_binary.hpp"
+#include "../api/util/crc32.hpp"
+#include <unistd.h>
 
-static Elf32_Ehdr* elf_header_location;
-
-static const Elf32_Ehdr& elf_header() noexcept {
-  return *elf_header_location;
-}
+static char* elf_header_location;
 static const char* elf_offset(int o) noexcept {
-  return (char*)elf_header_location + o;
+  return elf_header_location + o;
 }
 
-static void prune_elf_symbols();
-static char* pruned_location;
-static int   pruned_size = 0;
+static char* pruned_location = nullptr;
+static const char* syms_file = "_elf_symbols.bin";
+
+static int prune_elf_symbols(char*);
 
 int main(int argc, const char** args)
 {
@@ -34,12 +35,20 @@ int main(int argc, const char** args)
   assert(res == size);
   fclose(f);
 
-  // validate symbols
-  elf_header_location = (decltype(elf_header_location)) fdata;
-  prune_elf_symbols();
+  auto carch = getenv("ARCH");
+  std::string arch = "x86_64";
+  if (carch) arch = std::string(carch);
+//  fprintf(stderr, "ARCH = %s\n", arch.c_str());
+
+  int pruned_size = 0;
+  fprintf(stderr, "%s: Pruning ELF symbols \n", args[0]);
+
+  pruned_size = prune_elf_symbols(fdata);
+  // validate size
+  assert(pruned_size != 0);
 
   // write symbols to binary file
-  f = fopen("_elf_symbols.bin", "w");
+  f = fopen(syms_file, "w");
   assert(f);
   fwrite(pruned_location, sizeof(char), pruned_size, f);
   fclose(f);
@@ -47,36 +56,47 @@ int main(int argc, const char** args)
 }
 
 struct SymTab {
-  Elf32_Sym* base;
-  uint32_t   entries;
+  const char* base;
+  uint32_t    entries;
 };
 struct StrTab {
-  char*    base;
-  uint32_t size;
-};
-struct relocate_header {
-  SymTab symtab;
-  StrTab strtab;
+  const char* base;
+  uint32_t    size;
+
+  StrTab(const char* base, uint32_t size) : base(base), size(size) {}
 };
 
-struct relocate_header32 {
-  uint32_t symtab_base;
-  uint32_t symtab_entries;
-  uint32_t strtab_base;
-  uint32_t strtab_size;
-};
-
-static int relocate_pruned_sections(char* new_location, SymTab& symtab, StrTab& strtab)
+struct relocate_header
 {
-  auto& hdr = *(relocate_header32*) new_location;
+  uint32_t  symtab_entries;
+  uint32_t  strtab_size;
+  uint32_t  sanity_check;
+  uint32_t  checksum_syms;
+  uint32_t  checksum_strs;
+  char      data[0];
+};
+
+template <typename ElfSym, int Bits>
+static int relocate_pruned(char* new_location, SymTab& symtab, StrTab& strtab)
+{
+  auto& hdr = *(relocate_header*) new_location;
 
   // first prune symbols
-  auto*  symloc = (Elf32_Sym*) (new_location + sizeof(relocate_header32));
+  auto*  symloc = (ElfSym*) hdr.data;
   size_t symidx = 0;
   for (size_t i = 0; i < symtab.entries; i++)
   {
-    auto& cursym = symtab.base[i];
-    if (ELF32_ST_TYPE(cursym.st_info) == STT_FUNC) {
+    auto& cursym = ((const ElfSym*) symtab.base)[i];
+    int   type;
+    if (Bits == 32)
+        type = ELF32_ST_TYPE(cursym.st_info);
+    else if (Bits == 64)
+        type = ELF64_ST_TYPE(cursym.st_info);
+    else
+        throw std::runtime_error("Invalid bits");
+    // we want both functions and untyped, because some
+    // C functions are NOTYPE
+    if (type == STT_FUNC || type == STT_NOTYPE) {
       symloc[symidx++] = cursym;
     }
   }
@@ -100,31 +120,46 @@ static int relocate_pruned_sections(char* new_location, SymTab& symtab, StrTab& 
   }
   // new entry base and total length
   hdr.strtab_size = index;
-  // length of the whole thing
-  return sizeof(relocate_header32) +
-         hdr.symtab_entries * sizeof(Elf32_Sym) +
+  // length of symbols & strings
+  const size_t size =
+         hdr.symtab_entries * sizeof(ElfSym) +
          hdr.strtab_size * sizeof(char);
+
+  // checksum of symbols & strings and the entire section
+  hdr.checksum_syms = crc32(symloc, hdr.symtab_entries * sizeof(ElfSym));
+  hdr.checksum_strs = crc32(strloc, hdr.strtab_size);
+  uint32_t all = crc32(&hdr, sizeof(relocate_header) + size);
+  fprintf(stderr, "ELF symbols: %08x  "
+                  "ELF strings: %08x  "
+                  "ELF section: %08x\n",
+                  hdr.checksum_syms, hdr.checksum_strs, all);
+  hdr.sanity_check = 0;
+  // header consistency check
+  hdr.sanity_check = crc32(new_location, sizeof(relocate_header));
+
+  // return total length
+  return sizeof(relocate_header) + size;
 }
 
-static void prune_elf_symbols()
+template <int Bits, typename ElfEhdr, typename ElfShdr, typename ElfSym>
+static int prune_elf_symbols()
 {
   SymTab symtab { nullptr, 0 };
-  StrTab strtab { nullptr, 0 };
-  auto& elf_hdr = elf_header();
+  std::vector<StrTab> strtabs;
+  auto& elf_hdr = *(ElfEhdr*) elf_header_location;
   //printf("ELF header has %u sections\n", elf_hdr.e_shnum);
 
-  auto* shdr = (Elf32_Shdr*) elf_offset(elf_hdr.e_shoff);
+  auto* shdr = (ElfShdr*) elf_offset(elf_hdr.e_shoff);
 
-  for (Elf32_Half i = 0; i < elf_hdr.e_shnum; i++)
+  for (auto i = 0; i < elf_hdr.e_shnum; i++)
   {
     switch (shdr[i].sh_type) {
     case SHT_SYMTAB:
-      symtab = SymTab { (Elf32_Sym*) elf_offset(shdr[i].sh_offset),
-                        shdr[i].sh_size / (int) sizeof(Elf32_Sym) };
+      symtab = SymTab { elf_offset(shdr[i].sh_offset),
+                        (uint32_t) shdr[i].sh_size / (uint32_t) sizeof(ElfSym) };
       break;
     case SHT_STRTAB:
-      strtab = StrTab { (char*) elf_offset(shdr[i].sh_offset),
-                        shdr[i].sh_size };
+      strtabs.emplace_back(elf_offset(shdr[i].sh_offset), shdr[i].sh_size);
       break;
     case SHT_DYNSYM:
     default:
@@ -134,14 +169,43 @@ static void prune_elf_symbols()
   //printf("symtab at %p (%u entries)\n", symtab.base, symtab.entries);
 
   // not stripped
-  if (symtab.entries && strtab.size) {
+  if (symtab.entries && !strtabs.empty()) {
+    StrTab strtab = *std::max_element(std::begin(strtabs), std::end(strtabs),
+                    [](auto const& lhs, auto const& rhs) { return lhs.size < rhs.size; });
+
     // allocate worst case, guaranteeing we have enough space
     pruned_location =
-        new char[sizeof(relocate_header32) + symtab.entries * sizeof(Elf32_Sym) + strtab.size];
-    pruned_size = relocate_pruned_sections(pruned_location, symtab, strtab);
-    return;
+        new char[sizeof(relocate_header) + symtab.entries * sizeof(ElfSym) + strtab.size];
+    return relocate_pruned<ElfSym, Bits>(pruned_location, symtab, strtab);
   }
   // stripped variant
-  pruned_location = new char[sizeof(relocate_header32)];
-  pruned_size = sizeof(relocate_header32);
+  pruned_location = new char[sizeof(relocate_header)];
+  memset(pruned_location, 0, sizeof(relocate_header));
+  return sizeof(relocate_header);
+}
+
+static int prune_elf32_symbols(char* location)
+{
+  elf_header_location = location;
+  return prune_elf_symbols<32, Elf32_Ehdr, Elf32_Shdr, Elf32_Sym> ();
+}
+static int prune_elf64_symbols(char* location)
+{
+  elf_header_location = location;
+  return prune_elf_symbols<64, Elf64_Ehdr, Elf64_Shdr, Elf64_Sym> ();
+}
+
+static int prune_elf_symbols(char* location)
+{
+  auto* hdr = (Elf32_Ehdr*) location;
+  assert(hdr->e_ident[EI_MAG0] == ELFMAG0);
+  assert(hdr->e_ident[EI_MAG1] == ELFMAG1);
+  assert(hdr->e_ident[EI_MAG2] == ELFMAG2);
+  assert(hdr->e_ident[EI_MAG3] == ELFMAG3);
+
+  if (hdr->e_ident[EI_CLASS] == ELFCLASS32)
+      return prune_elf32_symbols(location);
+  else if (hdr->e_ident[EI_CLASS] == ELFCLASS64)
+      return prune_elf64_symbols(location);
+  assert(0 && "Unknown ELF class");
 }

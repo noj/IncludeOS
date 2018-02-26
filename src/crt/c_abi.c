@@ -21,14 +21,15 @@
 #include <util/memstream.h>
 #include <stdio.h>
 #include <sys/reent.h>
+#include <malloc.h>
 #include <string.h>
+#include <kprint>
 
-#define HEAP_ALIGNMENT   16
-caddr_t heap_begin;
-caddr_t heap_end;
+#define HEAP_ALIGNMENT   63
+void* heap_begin;
+void* heap_end;
 
 /// IMPLEMENTATION OF Newlib I/O:
-struct _reent newlib_reent;
 #undef stdin
 #undef stdout
 #undef stderr
@@ -38,87 +39,88 @@ __FILE* stdout;
 __FILE* stderr;
 
 // stack-protector guard
-#ifndef _STACK_GUARD_VALUE_
-#define _STACK_GUARD_VALUE_ 0xe2dee396
-#endif
-const uintptr_t __stack_chk_guard = _STACK_GUARD_VALUE_;
+const uintptr_t __stack_chk_guard = (uintptr_t) _STACK_GUARD_VALUE_;
 extern void panic(const char* why) __attribute__((noreturn));
 
-#define RANDOMIZE_HEAP_BASE
+void _init_bss()
+{
+  /// Initialize .bss section
+  extern char _BSS_START_, _BSS_END_;
+  __builtin_memset(&_BSS_START_, 0, &_BSS_END_ - &_BSS_START_);
+}
+
+void _init_heap(uintptr_t free_mem_begin)
+{
+  // NOTE: Initialize the heap before exceptions
+  // cache-align heap, because its not aligned
+  heap_begin = (void*) free_mem_begin + HEAP_ALIGNMENT;
+  heap_begin = (void*) ((uintptr_t)heap_begin & ~HEAP_ALIGNMENT);
+  // heap end tracking, used with sbrk
+  heap_end   = heap_begin;
+}
+
+uint32_t _move_symbols(void* sym_loc)
+{
+  extern char _ELF_SYM_START_;
+  /// read out size of symbols **before** moving them
+  extern int  _get_elf_section_datasize(const void*);
+  int elfsym_size = _get_elf_section_datasize(&_ELF_SYM_START_);
+  elfsym_size = (elfsym_size < HEAP_ALIGNMENT) ? HEAP_ALIGNMENT : elfsym_size;
+
+  /// move ELF symbols to safe area
+  extern void _move_elf_syms_location(const void*, void*);
+  _move_elf_syms_location(&_ELF_SYM_START_, sym_loc);
+
+  return elfsym_size;
+}
+
+static void crt_sanity_checks()
+{
+  // validate that heap is aligned
+  int validate_heap_alignment =
+    ((uintptr_t)heap_begin & (uintptr_t) HEAP_ALIGNMENT) == 0;
+
+  extern char _end;
+  assert(heap_begin >= (void*) &_end);
+  assert(heap_end >= heap_begin);
+  assert(validate_heap_alignment);
+}
 
 void _init_c_runtime()
 {
-  /// init backtrace functionality
-  extern void _move_elf_symbols(void*, void*);
-  extern void _apply_parser_data(void*);
-  // there is a 640k conventional memory hole at the beginning of memory
-  // put symbols at 40k
-  void* SYM_LOCATION = (void*) 0xA000;
-  // move pruned symbols to unused memory
-  extern char _ELF_SYM_START_;
-  _move_elf_symbols(&_ELF_SYM_START_, SYM_LOCATION);
-
-  // Initialize .bss section
-  extern char _BSS_START_, _BSS_END_;
-  streamset8(&_BSS_START_, 0, &_BSS_END_ - &_BSS_START_);
-
-  // Initialize the heap before exceptions
-  extern char _end;
-  heap_begin = &_end + 0xfff;
-  // page-align heap, because its not aligned
-  heap_begin = (char*) ((uintptr_t)heap_begin & 0xfffff000);
-#ifdef RANDOMIZE_HEAP_BASE
-  // randomize heap start location
-  int64_t tsc;
-  asm volatile ("rdtsc" : "=A"(tsc));
-  // 512kb randomization in pages
-  heap_begin += (tsc & 0x7f) << 12;
-#endif
-  // heap end tracking, used with sbrk
-  heap_end   = heap_begin;
-  // validate that heap is page aligned
-  int validate_heap_alignment = ((uintptr_t)heap_begin & 0xfff) == 0;
-
   /// initialize newlib I/O
-  newlib_reent = (struct _reent) _REENT_INIT(newlib_reent);
-  // set newlibs internal structure to ours
-  _REENT = &newlib_reent;
+  _REENT_INIT_PTR(_REENT);
   // Unix standard streams
   stdin  = _REENT->_stdin;  // stdin  == 1
   stdout = _REENT->_stdout; // stdout == 2
   stderr = _REENT->_stderr; // stderr == 3
 
   /// initialize exceptions before we can run constructors
-  extern void* __eh_frame_start;
+  extern char __eh_frame_start[];
   // Tell the stack unwinder where exception frames are located
   extern void __register_frame(void*);
   __register_frame(&__eh_frame_start);
 
-  // move symbols (again) to heap
-  extern void* _relocate_to_heap(void*);
-  void* symheap = _relocate_to_heap(SYM_LOCATION);
+  /// init ELF / backtrace functionality
+  extern void _init_elf_parser();
+  _init_elf_parser();
 
-  /// call global constructors emitted by compiler
-  extern void _init();
-  _init();
-
-  // set ELF symbols location here (after initializing everything else)
-  _apply_parser_data(symheap);
-
-  // sanity checks
-  assert(heap_begin >= &_end);
-  assert(heap_end >= heap_begin);
-  assert(validate_heap_alignment);
+  crt_sanity_checks();
 }
-
-// global/static objects should never be destructed here, so ignore this
-void* __dso_handle;
 
 // stack-protector
 __attribute__((noreturn))
 void __stack_chk_fail(void)
 {
   panic("Stack protector: Canary modified");
+  __builtin_unreachable();
+}
+
+__attribute__((noreturn))
+void __stack_chk_fail_local(void)
+{
+  panic("Stack protector: Canary modified");
+  __builtin_unreachable();
 }
 
 // old function result system
@@ -126,6 +128,17 @@ int errno = 0;
 int* __errno_location(void)
 {
   return &errno;
+}
+
+#include <setjmp.h>
+int _setjmp(jmp_buf env)
+{
+  return setjmp(env);
+}
+// linux strchr variant (NOTE: not completely the same!)
+void *__rawmemchr (const void *s, int c)
+{
+  return strchr((const char*) s, c);
 }
 
 /// assert() interface of ISO POSIX (2003)
@@ -148,6 +161,21 @@ int sched_yield(void)
   return -1;
 }
 
+void* __memcpy_chk(void* dest, const void* src, size_t len, size_t destlen)
+{
+  assert (len <= destlen);
+  return memcpy(dest, src, len);
+}
+void * __memset_chk(void* dest, int c, size_t len, size_t destlen)
+{
+  assert (len <= destlen);
+  return memset(dest, c, len);
+}
+
+void *aligned_alloc(size_t alignment, size_t size)
+{
+  return memalign(alignment, size);
+}
 
 int access(const char *pathname, int mode)
 {
@@ -156,30 +184,14 @@ int access(const char *pathname, int mode)
 
   return 0;
 }
-char* getcwd(char *buf, size_t size)
-{
-  (void) buf;
-  (void) size;
-	return 0;
-}
+
 int fcntl(int fd, int cmd, ...)
 {
   (void) fd;
   (void) cmd;
 	return 0;
 }
-int fchmod(int fd, mode_t mode)
-{
-  (void) fd;
-  (void) mode;
-	return 0;
-}
-int mkdir(const char *pathname, mode_t mode)
-{
-  (void) pathname;
-  (void) mode;
-	return 0;
-}
+
 int rmdir(const char *pathname)
 {
   (void) pathname;

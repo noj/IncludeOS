@@ -20,17 +20,14 @@
 
 double mysecond()
 {
-  return OS::micros_since_boot() / 1000000.f;
+  return OS::nanos_since_boot() / 1.0e9;
 }
 
-void Service::start(const std::string&)
+void Service::start()
 {
-  std::cout << "*** Service is up - with OS Included! ***" << std::endl;
-
   // do the STREAM test here
+  printf("Running STREAM benchmark\n");
   extern int main();
   main();
-
-  std::cout << "Service out!" << std::endl;
   OS::shutdown();
 }

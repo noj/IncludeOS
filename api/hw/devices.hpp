@@ -19,20 +19,10 @@
 #define HW_DEVICES_HPP
 
 #include <common>
-#include <virtio/console.hpp>
-
 #include "nic.hpp"
-#include "pit.hpp"
-#include "drive.hpp"
-
-class PCI_manager; // for friending
+#include "block_device.hpp"
 
 namespace hw {
-
-  /** @Todo: Implement */
-  class Serial;
-  class APIC;
-  class HPET;
 
   class Device_not_found;
 
@@ -53,32 +43,15 @@ namespace hw {
     static Nic& nic(const int N)
     { return get<Nic>(N); }
 
-    static Drive& drive(const int N)
-    { return get<Drive>(N); }
-
-    /** Get console N using driver DRIVER */
-    /*
-    template <int N, typename DRIVER>
-    static DRIVER& console() {
-      static DRIVER con_ {PCI_manager::device<PCI::COMMUNICATION>(N)};
-      return con_;
-    }
-    */
-
-    /**
-     *  Get serial port n
-     *
-     *  @Todo: Make a serial port class, and move rsprint / rswrite etc. from OS out to it.
-     *
-     *  @Note: The DRIVER parameter is there to support virtio serial ports.
-     */
-    template <typename DRIVER>
-    static PCI_Device& serial(int n);
+    static Block_device& drive(const int N)
+    { return get<Block_device>(N); }
 
     /** List all devices (decorated, as seen in boot output) */
     inline static void print_devices();
 
-  private:
+    inline static void flush_all();
+
+    inline static void deactivate_all();
 
     /**
      * @brief Retreive reference to the given Device on pos N
@@ -120,12 +93,13 @@ namespace hw {
         dev->device_type(), devices<Device_type>().size()-1);
     }
 
+  private:
     /** Print a decorated indexed list with the devices of the given type. No output if empty */
     template <typename Device_type>
     inline static void print_devices(const Device_registry<Device_type>& devices);
 
-    /** Following classes are allowed to register a device */
-    friend class ::PCI_manager;
+    template <typename Device_type>
+    inline static void deactivate_type(Device_registry<Device_type>& devices);
 
   }; //< class Devices
 
@@ -160,7 +134,8 @@ namespace hw {
       INFO2("+--+ %s", Device_type::device_type());
 
       for(size_t i = 0; i < devices.size(); i++)
-        INFO2("|  + #%u: %s", i, devices[i]->name());
+        INFO2("|  + #%u: %s, driver %s", (uint32_t) i, devices[i]->device_name().c_str(),
+              devices[i]->driver_name());
     }
   }
 
@@ -168,11 +143,29 @@ namespace hw {
   {
     INFO("Devices", "Listing registered devices");
 
-    print_devices(devices<hw::Drive>());
+    print_devices(devices<hw::Block_device>());
     print_devices(devices<hw::Nic>());
 
     INFO2("|");
     INFO2("o");
+  }
+
+  // helpers to shutdown PCI devices
+  template <typename Device_type>
+  inline void Devices::deactivate_type(Device_registry<Device_type>& devices)
+  {
+    for (auto& dev : devices)
+        dev->deactivate();
+  }
+  inline void Devices::deactivate_all()
+  {
+    deactivate_type(devices<hw::Block_device>());
+    deactivate_type(devices<hw::Nic>());
+  }
+  inline void Devices::flush_all()
+  {
+    for (auto& dev : devices<hw::Nic>())
+        dev->flush();
   }
 
 } //< namespace hw

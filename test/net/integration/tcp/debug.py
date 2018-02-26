@@ -4,7 +4,7 @@ import socket
 import sys
 
 # Usage: python test.py $GUEST_IP $HOST_IP
-GUEST = '10.0.0.42' if (len(sys.argv) < 2) else sys.argv[1]
+GUEST = '10.0.0.44' if (len(sys.argv) < 2) else sys.argv[1]
 HOST = '10.0.0.1' if (len(sys.argv) < 3) else sys.argv[2]
 
 def connect(port):
@@ -33,6 +33,7 @@ connect(8084)
 
 def listen(port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_address = (HOST, port)
     print >>sys.stderr, 'starting up on %s port %s' % server_address
     sock.bind(server_address)

@@ -20,15 +20,25 @@
 
 #include <deque>
 #include <map>
+#include <cstring>
+#include <unordered_map>
+
 #include "../inet.hpp"
 #include "ip4.hpp"
-#include <cstring>
 #include <net/packet.hpp>
+#include <net/socket.hpp>
+#include <util/timer.hpp>
+#include <rtc>
 
 namespace net {
 
   class PacketUDP;
   class UDPSocket;
+
+  struct UDP_error : public std::runtime_error {
+    using base = std::runtime_error;
+    using base::base;
+  };
 
   /** Basic UDP support. @todo Implement UDP sockets.  */
   class UDP {
@@ -36,24 +46,26 @@ namespace net {
     using addr_t = IP4::addr;
     using port_t = uint16_t;
 
-    using Packet_ptr = std::unique_ptr<PacketUDP, std::default_delete<net::Packet>>;
-    using Stack  = Inet<LinkLayer, IP4>;
+    using Packet_ptr    = std::unique_ptr<PacketUDP, std::default_delete<net::Packet>>;
+    using Stack         = IP4::Stack;
+
+    using Sockets       = std::map<Socket, UDPSocket>;
 
     typedef delegate<void()> sendto_handler;
+    typedef delegate<void(const Error&)> error_handler;
 
     // write buffer for sendq
     struct WriteBuffer
     {
       WriteBuffer(
-                  const uint8_t* data, size_t length, sendto_handler cb,
+                  const uint8_t* data, size_t length, sendto_handler cb, error_handler ecb,
                   UDP& udp, addr_t LA, port_t LP, addr_t DA, port_t DP);
 
-      int remaining() const {
-        return len - offset;
-      }
-      bool done() const {
-        return offset == len;
-      }
+      int remaining() const
+      { return len - offset; }
+
+      bool done() const
+      { return offset == len; }
 
       size_t packets_needed() const;
       void write();
@@ -63,7 +75,9 @@ namespace net {
       size_t len;
       size_t offset;
       // the callback for when this buffer is written
-      sendto_handler callback;
+      sendto_handler send_callback;
+      // the callback for when this receives an error
+      error_handler error_callback;
       // the UDP stack
       UDP& udp;
 
@@ -73,21 +87,15 @@ namespace net {
       // destination address and port
       port_t d_port;
       addr_t d_addr;
-    };
+    }; // < struct WriteBuffer
 
     /** UDP header */
-    struct udp_header {
+    struct header {
       port_t   sport;
       port_t   dport;
       uint16_t length;
       uint16_t checksum;
     };
-
-    /** Full UDP Header with all sub-headers */
-    struct full_header {
-      IP4::full_header full_hdr;
-      udp_header       udp_hdr;
-    }__attribute__((packed));
 
     ////////////////////////////////////////////
 
@@ -95,11 +103,17 @@ namespace net {
     { return stack_.ip_addr(); }
 
     /** Input from network layer */
-    void bottom(net::Packet_ptr);
+    void receive(net::Packet_ptr);
 
     /** Delegate output to network layer */
     void set_network_out(downstream del)
     { network_layer_out_ = del; }
+
+    /**
+     *  Is called when an Error has occurred in the OS
+     *  F.ex.: An ICMP error message has been received in response to a sent UDP datagram
+    */
+    void error_report(const Error& err, Socket dest);
 
     /** Send UDP datagram from source ip/port to destination ip/port.
 
@@ -110,59 +124,104 @@ namespace net {
     void transmit(UDP::Packet_ptr udp);
 
     //! @param port local port
-    UDPSocket& bind(port_t port);
+    UDPSocket& bind(port_t port)
+    { return bind({stack_.ip_addr(), port}); }
+
+    UDPSocket& bind(const Socket socket);
 
     //! returns a new UDP socket bound to a random port
-    UDPSocket& bind();
+    UDPSocket& bind()
+    { return bind(stack_.ip_addr()); }
 
-    bool is_bound(port_t port);
+    UDPSocket& bind(const ip4::Addr addr);
 
-    /** Close a port **/
-    void close(port_t port);
+    bool is_bound(const Socket) const;
+
+    bool is_bound(const port_t port) const
+    { return is_bound({stack_.ip_addr(), port}); }
+
+    /** Close a socket **/
+    void close(const Socket socket);
 
     //! construct this UDP module with @inet
     UDP(Stack& inet);
 
     Stack& stack()
-    {
-      return stack_;
-    }
+    { return stack_; }
 
     // send as much as possible from sendq
     void flush();
 
+    /** Flush expired error entries (in error_callbacks_) when flush_timer_ has timed out */
+    void flush_expired();
+
     // create and transmit @num packets from sendq
     void process_sendq(size_t num);
 
-    inline constexpr uint16_t max_datagram_size() noexcept {
-      return stack().ip_obj().MDDS() - sizeof(udp_header);
-    }
+    uint16_t max_datagram_size() noexcept
+    { return stack().ip_obj().MDDS() - sizeof(header); }
 
-    class Port_in_use_exception : public std::exception {
+    class Port_in_use_exception : public UDP_error {
     public:
       Port_in_use_exception(UDP::port_t p)
-        : port_(p) {}
-      virtual const char* what() const noexcept {
-        return "UDP port allready in use";
-      }
+        : UDP_error{"UDP port already in use: " + std::to_string(p)},
+          port_(p) {}
 
-      UDP::port_t port(){
-        return port_;
-      }
+      UDP::port_t port() const
+      { return port_; }
 
     private:
-      UDP::port_t port_;
+      const UDP::port_t port_;
     };
 
   private:
+    static constexpr uint16_t exp_t_ {60 * 5};
 
-    downstream  network_layer_out_;
-    Stack&      stack_;
-    std::map<port_t, UDPSocket> ports_;
-    port_t      current_port_ {1024};
+    std::chrono::minutes        flush_interval_{5};
+    downstream                  network_layer_out_;
+    Stack&                      stack_;
+    Sockets                     sockets_;
+    Stack::Port_utils&          ports_;
 
     // the async send queue
     std::deque<WriteBuffer> sendq;
+
+
+    Sockets::iterator find(const Socket socket)
+    {
+      Sockets::iterator it = sockets_.find(socket);
+      return it;
+    }
+
+    Sockets::const_iterator cfind(const Socket socket) const
+    {
+      Sockets::const_iterator it = sockets_.find(socket);
+      return it;
+    }
+
+    /** Error entries are just error callbacks and timestamps */
+    class Error_entry {
+    public:
+      Error_entry(UDP::error_handler cb) noexcept
+      : callback(std::move(cb)), timestamp(RTC::time_since_boot())
+      {}
+
+      bool expired() noexcept
+      { return timestamp + exp_t_ < RTC::time_since_boot(); }
+
+      UDP::error_handler callback;
+
+    private:
+      RTC::timestamp_t timestamp;
+
+    }; //< class Error_entry
+
+    /** The error callbacks that the user has sent in via the UDPSockets' sendto and bcast methods */
+    std::unordered_map<Socket, Error_entry> error_callbacks_;
+
+    /** Timer that flushes expired error entries/callbacks (no errors have occurred) */
+    Timer flush_timer_{{ *this, &UDP::flush_expired }};
+
     friend class net::UDPSocket;
   }; //< class UDP
 

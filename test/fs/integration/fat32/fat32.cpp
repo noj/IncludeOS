@@ -23,10 +23,9 @@
 
 // Includes std::string internal_banana
 #include "banana.ascii"
+static std::shared_ptr<fs::Disk> disk;
 
-std::shared_ptr<fs::Disk> disk;
-
-const uint64_t SIZE = 4000000000;
+const uint64_t SIZE = 4294967296;
 const std::string shallow_banana{"/banana.txt"};
 const std::string deep_banana{"/dir1/dir2/dir3/dir4/dir5/dir6/banana.txt"};
 
@@ -35,16 +34,17 @@ void is_done() {
   if (++counter == 3) INFO("FAT32","SUCCESS\n");
 }
 
-void test2() {
+void test2()
+{
   INFO("FAT32", "Remounting disk.");
-  disk->mount(disk->MBR,
-  [] (fs::error_t err)
+
+  CHECKSERT(not disk->empty(), "Disk not empty");
+  CHECKSERT(disk->dev().size() == SIZE / 512, "Disk size is %llu bytes", SIZE);
+
+  disk->init_fs(disk->MBR,
+  [] (fs::error_t err, auto& fs)
   {
     CHECKSERT(not err, "Filesystem mounted on VBR1");
-    CHECKSERT(not disk->empty(), "Disk not empty");
-    CHECKSERT(disk->dev().size() == SIZE / 512, "Disk size is %llu bytes", SIZE);
-
-    auto& fs = disk->fs();
 
     fs.stat(shallow_banana,
     [] (auto err, const auto& ent) {
@@ -60,12 +60,12 @@ void test2() {
     });
 
     fs.read_file(shallow_banana,
-    [] (fs::error_t err, fs::buffer_t buf, uint64_t len)
+    [] (fs::error_t err, fs::buffer_t buf)
     {
       INFO("FAT32", "Read file");
       CHECKSERT(not err, "read_file: Read %s asynchronously", shallow_banana.c_str());
       printf("%s\n", internal_banana.c_str());
-      std::string banana((char*) buf.get(), len);
+      std::string banana((const char*) buf->data(), buf->size());
       CHECKSERT(banana == internal_banana, "Correct shallow banana");
       is_done();
     });
@@ -83,12 +83,12 @@ void test2() {
 
       // asynch file reading test
       fs.read(ent, 0, ent.size(),
-      [] (fs::error_t err, fs::buffer_t buf, uint64_t len)
+      [] (fs::error_t err, fs::buffer_t buf)
       {
         INFO("FAT32", "Read inside stat");
         CHECKSERT(not err, "read: Read %s asynchronously", deep_banana.c_str());
 
-        std::string banana((char*) buf.get(), len);
+        std::string banana((const char*) buf->data(), buf->size());
         CHECKSERT(banana == internal_banana, "Correct deep fried banana");
         is_done();
       });
@@ -97,7 +97,7 @@ void test2() {
   });
 }
 
-void Service::start(const std::string&)
+void Service::start()
 {
   auto& device = hw::Devices::drive(0);
   disk = std::make_shared<fs::Disk> (device);
@@ -111,12 +111,11 @@ void Service::start(const std::string&)
   CHECKSERT(disk->dev().size() == SIZE / 512, "Disk size is %llu sectors", SIZE / 512);
 
   // auto-mount filesystem
-  disk->mount(
-  [] (fs::error_t err)
+  disk->init_fs(
+  [] (fs::error_t err, auto& fs)
   {
-    CHECKSERT(!err, "Filesystem auto-mounted");
+    CHECKSERT(!err, "Filesystem auto-initializedd");
 
-    auto& fs = disk->fs();
     std::string fat32_str{"FAT32"};
     CHECKSERT(fs.name() == fat32_str, "Filesystem recognized as FAT32");
 
@@ -128,9 +127,8 @@ void Service::start(const std::string&)
       auto& e = ents->at(0);
       CHECKSERT(e.is_file(), "Ent is a file");
       CHECKSERT(e.name() == "banana.txt", "Ents name is 'banana.txt'");
+
       test2();
     });
   });
-  // re-mount on VBR1
-  /**/
 }

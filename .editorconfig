@@ -15,3 +15,12 @@ indent_style = tab
 
 [Makelib]
 indent_style = tab
+
+[*.py]
+indent_size = 4
+
+[boot]
+indent_size = 4
+
+[*.asm]
+indent_size = 4
